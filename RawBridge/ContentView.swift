@@ -8,9 +8,14 @@ struct ContentView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 16) {
-                    headerCard
+                    eventCard
                     connectionCard
                     folderCard
+
+                    if !model.extensionStats.isEmpty {
+                        extensionPickerCard
+                    }
+
                     transferCard
                 }
                 .padding()
@@ -25,16 +30,35 @@ struct ContentView: View {
         }
     }
 
-    private var headerCard: some View {
+    private var eventCard: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("SỰ KIỆN")
+            Text("1 • THÔNG TIN SỰ KIỆN")
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
 
-            TextField("Ví dụ: Khai giảng 2026", text: $model.eventName)
-                .textFieldStyle(.roundedBorder)
+            TextField(
+                "Tên sự kiện, ví dụ: Khai giảng 2026",
+                text: $model.eventName
+            )
+            .textFieldStyle(.roundedBorder)
 
-            Text("App chỉ truyền file. RAW/video gốc không bị đổi định dạng.")
+            Text("CONTENT SƠ BỘ")
+                .font(.caption2.bold())
+                .foregroundStyle(.secondary)
+
+            TextEditor(text: $model.roughContent)
+                .frame(minHeight: 120)
+                .padding(8)
+                .background(
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Color.secondary.opacity(0.10))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(Color.secondary.opacity(0.20))
+                )
+
+            Text("Phần này sẽ được lưu vào event.json để sau đó đưa cho AI viết caption/content và voice script.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
@@ -47,11 +71,14 @@ struct ContentView: View {
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
 
-            TextField("http://100.x.x.x:8000", text: $model.serverURL)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .keyboardType(.URL)
-                .textFieldStyle(.roundedBorder)
+            TextField(
+                "http://100.x.x.x:8000",
+                text: $model.serverURL
+            )
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .keyboardType(.URL)
+            .textFieldStyle(.roundedBorder)
 
             Button {
                 Task { await model.testConnection() }
@@ -67,26 +94,34 @@ struct ContentView: View {
 
     private var folderCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("THẺ NHỚ / THƯ MỤC")
+            Text("2 • CHỌN THƯ MỤC / THẺ NHỚ")
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
 
             HStack {
-                Image(systemName: "folder")
-                VStack(alignment: .leading) {
+                Image(systemName: "externaldrive")
+                    .font(.title2)
+
+                VStack(alignment: .leading, spacing: 2) {
                     Text(model.selectedFolderName)
                         .font(.headline)
-                    Text(model.scanning ? "Đang quét ở nền..." : "Chọn một thư mục trên SD/Files")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+
+                    Text(
+                        model.scanning
+                        ? "Đang quét ở nền..."
+                        : "\(model.items.count) file • \(model.totalSizeText)"
+                    )
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
                 }
+
                 Spacer()
             }
 
             Button {
                 showFolderPicker = true
             } label: {
-                Label("Chọn thư mục", systemImage: "externaldrive")
+                Label("Chọn thư mục", systemImage: "folder.badge.plus")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
@@ -96,19 +131,86 @@ struct ContentView: View {
                 ProgressView()
                     .frame(maxWidth: .infinity)
             }
+        }
+        .cardStyle()
+    }
 
-            HStack(spacing: 10) {
-                stat(title: "RAW", value: "\(model.rawCount)")
-                stat(title: "VIDEO", value: "\(model.videoCount)")
-                stat(title: "TỔNG", value: model.totalSizeText)
+    private var extensionPickerCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("3 • TÍCH ĐUÔI FILE CẦN GỬI")
+                .font(.caption.bold())
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                quickButton("RAW", action: model.selectRawOnly)
+                quickButton("ẢNH", action: model.selectPhotoAndRaw)
+                quickButton("VIDEO", action: model.selectVideoOnly)
             }
+
+            HStack(spacing: 8) {
+                quickButton("TẤT CẢ", action: model.selectAll)
+                quickButton("BỎ CHỌN", action: model.clearSelection)
+            }
+
+            Divider()
+
+            ForEach(model.extensionStats) { stat in
+                Toggle(
+                    isOn: Binding(
+                        get: { model.isSelected(stat.ext) },
+                        set: { model.setSelected(stat.ext, $0) }
+                    )
+                ) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(".\(stat.ext.uppercased())")
+                                .font(.headline.monospaced())
+
+                            Text(categoryText(stat.category))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Spacer()
+
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text("\(stat.count) file")
+                                .font(.subheadline)
+                            Text(stat.sizeText)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .toggleStyle(.switch)
+
+                if stat.id != model.extensionStats.last?.id {
+                    Divider()
+                }
+            }
+
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("ĐÃ CHỌN")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text("\(model.selectedCount) file")
+                        .font(.headline)
+                }
+
+                Spacer()
+
+                Text(model.selectedSizeText)
+                    .font(.headline.monospacedDigit())
+            }
+            .padding(.top, 4)
         }
         .cardStyle()
     }
 
     private var transferCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("TRUYỀN VỀ PC")
+            Text("4 • GỬI VỀ PC")
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
 
@@ -147,29 +249,40 @@ struct ContentView: View {
                 Button {
                     Task { await model.startUpload() }
                 } label: {
-                    Label("Gửi tất cả về PC", systemImage: "arrow.up.circle.fill")
-                        .frame(maxWidth: .infinity)
+                    Label(
+                        "Gửi \(model.selectedCount) file về PC",
+                        systemImage: "arrow.up.circle.fill"
+                    )
+                    .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(model.items.isEmpty || model.scanning)
+                .disabled(
+                    model.selectedCount == 0 ||
+                    model.scanning ||
+                    model.eventName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                )
             }
         }
         .cardStyle()
     }
 
-    private func stat(title: String, value: String) -> some View {
-        VStack(spacing: 4) {
-            Text(title)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.headline)
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
+    private func quickButton(
+        _ title: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(title, action: action)
+            .font(.caption.bold())
+            .buttonStyle(.bordered)
+            .frame(maxWidth: .infinity)
+    }
+
+    private func categoryText(_ category: MediaCategory) -> String {
+        switch category {
+        case .raw: return "ẢNH RAW"
+        case .photo: return "ẢNH"
+        case .video: return "VIDEO"
+        case .other: return "KHÁC"
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 10)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 }
 
@@ -177,6 +290,9 @@ private extension View {
     func cardStyle() -> some View {
         self
             .padding()
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
+            .background(
+                .regularMaterial,
+                in: RoundedRectangle(cornerRadius: 18)
+            )
     }
 }

@@ -1,3 +1,11 @@
+# RAW Bridge 1.2
+
+Bản mới: content sơ bộ + quét/tích từng đuôi file + PC tự tách PHOTO/VIDEO + event metadata.
+
+Xem `UPDATE_V1.2.md`.
+
+---
+
 # RAW Bridge
 
 Bản MVP iPhone native truyền RAW/video từ thẻ SD về PC qua Tailscale.

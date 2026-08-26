@@ -45,7 +45,7 @@ final class RawFileUploader: NSObject, URLSessionTaskDelegate, URLSessionDataDel
 
         var path = components.path
         if path.hasSuffix("/") { path.removeLast() }
-        components.path = path + "/upload-raw"
+        components.path = path + "/upload-file"
         components.queryItems = [
             URLQueryItem(name: "event_name", value: eventName),
             URLQueryItem(name: "relative_path", value: relativePath),

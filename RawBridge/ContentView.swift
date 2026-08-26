@@ -141,17 +141,6 @@ struct ContentView: View {
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
 
-            HStack(spacing: 8) {
-                quickButton("RAW", action: model.selectRawOnly)
-                quickButton("ẢNH", action: model.selectPhotoAndRaw)
-                quickButton("VIDEO", action: model.selectVideoOnly)
-            }
-
-            HStack(spacing: 8) {
-                quickButton("TẤT CẢ", action: model.selectAll)
-                quickButton("BỎ CHỌN", action: model.clearSelection)
-            }
-
             Divider()
 
             ForEach(model.extensionStats) { stat in
@@ -264,16 +253,6 @@ struct ContentView: View {
             }
         }
         .cardStyle()
-    }
-
-    private func quickButton(
-        _ title: String,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(title, action: action)
-            .font(.caption.bold())
-            .buttonStyle(.bordered)
-            .frame(maxWidth: .infinity)
     }
 
     private func categoryText(_ category: MediaCategory) -> String {

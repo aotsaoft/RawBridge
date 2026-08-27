@@ -1,44 +1,83 @@
 import Foundation
 import Combine
 
-final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTaskDelegate {
-    static let shared = RawBackgroundUploadManager()
+final class RawBackgroundUploadManager:
+    NSObject,
+    ObservableObject,
+    URLSessionTaskDelegate {
 
-    @Published private(set) var totalFiles: Int = 0
-    @Published private(set) var completedFiles: Int = 0
-    @Published private(set) var currentFile: String = ""
-    @Published private(set) var statusText: String = "Chưa upload."
-    @Published private(set) var overallProgress: Double = 0
-    @Published private(set) var isUploading: Bool = false
-    @Published private(set) var isPaused: Bool = false
-    @Published private(set) var sessionCompleted: Bool = false
+    static let shared =
+        RawBackgroundUploadManager()
 
-    @Published private(set) var speedMBs: Double = 0
-    @Published private(set) var speedMbps: Double = 0
-    @Published private(set) var etaText: String = "--"
+    @Published private(set) var totalFiles = 0
+    @Published private(set) var completedFiles = 0
+    @Published private(set) var currentFile = ""
+    @Published private(set) var statusText =
+        "Chưa upload."
+
+    @Published private(set) var overallProgress:
+        Double = 0
+
+    @Published private(set) var isUploading = false
+    @Published private(set) var isPaused = false
+    @Published private(set) var sessionCompleted = false
+
+    // Chỉ hiển thị MB/s theo yêu cầu.
+    @Published private(set) var speedMBps:
+        Double = 0
+
+    @Published private(set) var etaText = "--"
 
     private let queueStoreURL: URL
-    private var uploadQueue: [UploadJob] = []
-    private var currentIndex: Int = 0
-    private var serverBase: String = "http://100.120.33.35:8000"
-    private var selectedExtensions: [String] = []
-    private var totalBytesExpected: Int64 = 0
-    private var totalBytesCompleted: Int64 = 0
-    private var backgroundCompletionHandler: (() -> Void)?
 
-    private var lastSpeedTime: TimeInterval = 0
-    private var lastSpeedBytes: Int64 = 0
-    private var smoothedBytesPerSecond: Double = 0
+    private var uploadQueue: [UploadJob] = []
+    private var completedJobIDs: Set<UUID> = []
+
+    private var serverBase =
+        "http://100.120.33.35:8000"
+
+    private var selectedExtensions: [String] = []
+
+    private var backgroundCompletionHandler:
+        (() -> Void)?
+
+    private let stateLock = NSLock()
+
+    private var sentByTask:
+        [Int: Int64] = [:]
+
+    private var lastSpeedTime:
+        TimeInterval = 0
+
+    private var lastSpeedBytes:
+        Int64 = 0
+
+    private var smoothedBytesPerSecond:
+        Double = 0
 
     private lazy var session: URLSession = {
-        let config = URLSessionConfiguration.background(
-            withIdentifier: "com.aotasoft.RawBridge.background-upload"
-        )
+        let config =
+            URLSessionConfiguration.background(
+                withIdentifier:
+                    "com.aotasoft.RawBridge.background-upload"
+            )
+
+        // Toàn bộ task được giao cho tiến trình hệ thống.
         config.sessionSendsLaunchEvents = true
         config.isDiscretionary = false
         config.waitsForConnectivity = true
+
+        config.allowsCellularAccess = true
+        config.allowsExpensiveNetworkAccess = true
+        config.allowsConstrainedNetworkAccess = true
+
+        // Xếp sẵn toàn bộ task, nhưng chỉ chạy tối đa
+        // vài kết nối đồng thời tới PC.
+        config.httpMaximumConnectionsPerHost = 2
+
         config.timeoutIntervalForRequest = 300
-        config.timeoutIntervalForResource = 60 * 60 * 24
+        config.timeoutIntervalForResource =
+            60 * 60 * 24
 
         return URLSession(
             configuration: config,
@@ -47,7 +86,10 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
         )
     }()
 
-    struct UploadJob: Codable, Identifiable {
+    struct UploadJob:
+        Codable,
+        Identifiable {
+
         let id: UUID
         let filePath: String
         let fileName: String
@@ -63,7 +105,7 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
 
     struct PersistedQueue: Codable {
         let queue: [UploadJob]
-        let currentIndex: Int
+        let completedJobIDs: [UUID]
         let serverBase: String
         let selectedExtensions: [String]
     }
@@ -76,75 +118,86 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
         let expected_bytes: Int64
     }
 
-    struct EventCompleteRequest: Codable {
-        let event_name: String
-        let selected_extensions: [String]
-        let file_count: Int
-        let total_bytes: Int64
-    }
-
     override init() {
-        let support = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first!
+        let support =
+            FileManager.default.urls(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask
+            ).first!
 
-        let folder = support.appendingPathComponent(
-            "RawBridge",
-            isDirectory: true
-        )
+        let folder =
+            support.appendingPathComponent(
+                "RawBridge",
+                isDirectory: true
+            )
 
-        try? FileManager.default.createDirectory(
-            at: folder,
-            withIntermediateDirectories: true
-        )
+        try? FileManager.default
+            .createDirectory(
+                at: folder,
+                withIntermediateDirectories: true
+            )
 
-        queueStoreURL = folder.appendingPathComponent("upload_queue.json")
+        queueStoreURL =
+            folder.appendingPathComponent(
+                "upload_queue_v2.json"
+            )
+
         super.init()
 
+        // Tạo session cùng identifier ngay khi app mở,
+        // để iOS reconnect các background task cũ.
         _ = session
         loadQueue()
     }
 
-    func setBackgroundCompletionHandler(_ handler: @escaping () -> Void) {
+    // MARK: - App lifecycle
+
+    func setBackgroundCompletionHandler(
+        _ handler: @escaping () -> Void
+    ) {
         backgroundCompletionHandler = handler
     }
 
     func resumeFromDisk() {
         loadQueue()
 
-        guard !uploadQueue.isEmpty,
-              currentIndex < uploadQueue.count else {
+        guard !uploadQueue.isEmpty else {
             return
         }
 
-        totalBytesExpected = uploadQueue.reduce(0) { $0 + $1.fileSize }
-        totalBytesCompleted = uploadQueue
-            .prefix(currentIndex)
-            .reduce(0) { $0 + $1.fileSize }
+        publishState()
 
-        publish {
-            self.totalFiles = self.uploadQueue.count
-            self.completedFiles = self.currentIndex
-            self.currentFile = self.uploadQueue[self.currentIndex].relativePath
-            self.isUploading = true
-            self.sessionCompleted = false
-            self.statusText = "Đang khôi phục queue upload..."
-        }
+        session.getAllTasks {
+            [weak self] tasks in
 
-        session.getAllTasks { [weak self] tasks in
             guard let self else { return }
 
-            if tasks.isEmpty {
-                self.startNextIfNeeded()
-            } else {
-                self.publish {
-                    self.statusText = "Đã khôi phục tác vụ upload nền."
-                    self.isPaused = tasks.allSatisfy { $0.state == .suspended }
+            let activeIDs =
+                Set(
+                    tasks.compactMap {
+                        self.jobID(from: $0)
+                    }
+                )
+
+            self.scheduleMissingTasks(
+                excluding: activeIDs
+            )
+
+            self.publish {
+                if self.completedJobIDs.count <
+                    self.uploadQueue.count {
+
+                    self.isUploading = true
+                    self.sessionCompleted = false
+
+                    self.statusText =
+                        "Đã khôi phục background queue: \(self.completedJobIDs.count)/\(self.uploadQueue.count) file xong."
                 }
             }
         }
     }
+
+    // MARK: - Start
 
     func enqueueAndStart(
         serverBase: String,
@@ -153,23 +206,33 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
         selectedExtensions: [String],
         files: [TransferModel.MediaRef]
     ) async throws {
+
         self.serverBase = serverBase
-        self.selectedExtensions = selectedExtensions
+        self.selectedExtensions =
+            selectedExtensions
 
-        let expectedBytes = files.reduce(Int64(0)) { $0 + $1.size }
+        let expectedBytes =
+            files.reduce(Int64(0)) {
+                $0 + $1.size
+            }
 
+        // Gửi metadata trước. Chỉ khi metadata OK
+        // mới xếp background tasks.
         try await postJSON(
             path: "/event-meta",
             body: EventMetaRequest(
                 event_name: eventName,
                 rough_content: roughContent,
-                selected_extensions: selectedExtensions,
-                expected_file_count: files.count,
-                expected_bytes: expectedBytes
+                selected_extensions:
+                    selectedExtensions,
+                expected_file_count:
+                    files.count,
+                expected_bytes:
+                    expectedBytes
             )
         )
 
-        let jobs = files.map {
+        uploadQueue = files.map {
             UploadJob(
                 id: UUID(),
                 filePath: $0.url.path,
@@ -177,90 +240,223 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
                 relativePath: $0.relativePath,
                 eventName: eventName,
                 fileSize: $0.size,
-                cleanupAfterUpload: $0.cleanupAfterUpload
+                cleanupAfterUpload:
+                    $0.cleanupAfterUpload
             )
         }
 
-        uploadQueue = jobs
-        currentIndex = 0
-        totalBytesExpected = expectedBytes
-        totalBytesCompleted = 0
+        completedJobIDs = []
         resetSpeedMeter()
         persistQueue()
 
         publish {
-            self.totalFiles = jobs.count
+            self.totalFiles =
+                self.uploadQueue.count
+
             self.completedFiles = 0
-            self.currentFile = jobs.first?.relativePath ?? ""
+            self.currentFile =
+                self.uploadQueue.first?
+                    .relativePath ?? ""
+
             self.overallProgress = 0
             self.isUploading = true
             self.isPaused = false
             self.sessionCompleted = false
-            self.speedMBs = 0
-            self.speedMbps = 0
+            self.speedMBps = 0
             self.etaText = "--"
-            self.statusText = "Bắt đầu upload nền..."
+
+            self.statusText =
+                "Đã xếp \(self.uploadQueue.count) file vào background queue."
         }
 
-        startNextIfNeeded()
+        // QUAN TRỌNG:
+        // Xếp TẤT CẢ task ngay bây giờ.
+        // iOS có thể suspend app nhưng tiến trình hệ thống
+        // vẫn còn toàn bộ hàng đợi để tự chạy.
+        scheduleMissingTasks(excluding: [])
     }
 
+    private func scheduleMissingTasks(
+        excluding activeIDs: Set<UUID>
+    ) {
+        guard !isPaused else { return }
+
+        for job in uploadQueue {
+            if completedJobIDs.contains(job.id) {
+                continue
+            }
+
+            if activeIDs.contains(job.id) {
+                continue
+            }
+
+            schedule(job)
+        }
+    }
+
+    private func schedule(_ job: UploadJob) {
+        guard FileManager.default
+            .fileExists(atPath: job.url.path)
+        else {
+            fail(
+                "Không còn tìm thấy file: \(job.fileName)"
+            )
+            return
+        }
+
+        guard var components =
+            URLComponents(string: serverBase)
+        else {
+            fail("Server URL không hợp lệ.")
+            return
+        }
+
+        var path = components.path
+
+        if path.hasSuffix("/") {
+            path.removeLast()
+        }
+
+        components.path =
+            path + "/upload-file"
+
+        components.queryItems = [
+            URLQueryItem(
+                name: "event_name",
+                value: job.eventName
+            ),
+            URLQueryItem(
+                name: "relative_path",
+                value: job.relativePath
+            ),
+            URLQueryItem(
+                name: "filename",
+                value: job.fileName
+            ),
+            URLQueryItem(
+                name: "job_id",
+                value: job.id.uuidString
+            )
+        ]
+
+        guard let url = components.url else {
+            fail("Server URL không hợp lệ.")
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+
+        request.setValue(
+            "application/octet-stream",
+            forHTTPHeaderField:
+                "Content-Type"
+        )
+
+        request.setValue(
+            String(job.fileSize),
+            forHTTPHeaderField:
+                "Content-Length"
+        )
+
+        let task =
+            session.uploadTask(
+                with: request,
+                fromFile: job.url
+            )
+
+        task.taskDescription =
+            job.id.uuidString
+
+        task.countOfBytesClientExpectsToSend =
+            job.fileSize
+
+        task.countOfBytesClientExpectsToReceive =
+            1024
+
+        task.resume()
+    }
+
+    // MARK: - Pause / resume
+
     func pause() {
-        session.getAllTasks { [weak self] tasks in
+        session.getAllTasks {
+            [weak self] tasks in
+
             guard let self else { return }
 
-            tasks.forEach { $0.suspend() }
+            tasks.forEach {
+                $0.suspend()
+            }
+
             self.resetSpeedMeter()
 
             self.publish {
                 self.isPaused = true
-                self.speedMBs = 0
-                self.speedMbps = 0
+                self.speedMBps = 0
                 self.etaText = "--"
-                self.statusText = "Đã tạm dừng."
+                self.statusText =
+                    "Đã tạm dừng \(tasks.count) background task."
             }
         }
     }
 
     func resume() {
-        session.getAllTasks { [weak self] tasks in
+        isPaused = false
+        resetSpeedMeter()
+
+        session.getAllTasks {
+            [weak self] tasks in
+
             guard let self else { return }
 
-            self.resetSpeedMeter()
+            let activeIDs =
+                Set(
+                    tasks.compactMap {
+                        self.jobID(from: $0)
+                    }
+                )
 
-            if tasks.isEmpty {
-                self.publish {
-                    self.isPaused = false
-                    self.isUploading = true
-                    self.statusText = "Đang tiếp tục..."
-                }
-                self.startNextIfNeeded()
-            } else {
-                tasks.forEach { $0.resume() }
+            tasks.forEach {
+                $0.resume()
+            }
 
-                self.publish {
-                    self.isPaused = false
-                    self.isUploading = true
-                    self.statusText = "Đang tiếp tục upload..."
-                }
+            self.scheduleMissingTasks(
+                excluding: activeIDs
+            )
+
+            self.publish {
+                self.isPaused = false
+                self.isUploading = true
+                self.statusText =
+                    "Đang tiếp tục background queue..."
             }
         }
     }
 
+    // MARK: - Completion / new session
+
     func resetForNewSession() {
         guard !isUploading else { return }
 
-        for job in uploadQueue where job.cleanupAfterUpload {
-            try? FileManager.default.removeItem(at: job.url)
+        for job in uploadQueue
+        where job.cleanupAfterUpload {
+            try? FileManager.default
+                .removeItem(at: job.url)
         }
 
-        uploadQueue.removeAll()
-        currentIndex = 0
+        uploadQueue = []
+        completedJobIDs = []
         selectedExtensions = []
-        totalBytesExpected = 0
-        totalBytesCompleted = 0
+
+        stateLock.lock()
+        sentByTask = [:]
+        stateLock.unlock()
+
         resetSpeedMeter()
-        try? FileManager.default.removeItem(at: queueStoreURL)
+
+        try? FileManager.default
+            .removeItem(at: queueStoreURL)
 
         publish {
             self.totalFiles = 0
@@ -271,132 +467,150 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
             self.isUploading = false
             self.isPaused = false
             self.sessionCompleted = false
-            self.speedMBs = 0
-            self.speedMbps = 0
+            self.speedMBps = 0
             self.etaText = "--"
         }
     }
 
-    private func startNextIfNeeded() {
-        guard !isPaused else { return }
-
-        guard currentIndex < uploadQueue.count else {
-            finishEvent()
+    private func markCompleted(
+        jobID: UUID,
+        taskIdentifier: Int
+    ) {
+        guard !completedJobIDs
+            .contains(jobID)
+        else {
             return
         }
 
-        let job = uploadQueue[currentIndex]
-        resetSpeedMeter()
-
-        publish {
-            self.currentFile = job.relativePath
-            self.isUploading = true
-            self.statusText =
-                "Đang gửi \(self.currentIndex + 1)/\(self.uploadQueue.count): \(job.fileName)"
-        }
-
-        guard var components = URLComponents(string: serverBase) else {
-            fail("Server URL không hợp lệ.")
-            return
-        }
-
-        var path = components.path
-        if path.hasSuffix("/") { path.removeLast() }
-
-        components.path = path + "/upload-file"
-        components.queryItems = [
-            URLQueryItem(name: "event_name", value: job.eventName),
-            URLQueryItem(name: "relative_path", value: job.relativePath),
-            URLQueryItem(name: "filename", value: job.fileName)
-        ]
-
-        guard let url = components.url else {
-            fail("Server URL không hợp lệ.")
-            return
-        }
-
-        guard FileManager.default.fileExists(atPath: job.url.path) else {
-            fail("Không còn tìm thấy file: \(job.fileName)")
-            return
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue(
-            "application/octet-stream",
-            forHTTPHeaderField: "Content-Type"
-        )
-        request.setValue(
-            String(job.fileSize),
-            forHTTPHeaderField: "Content-Length"
-        )
-
-        let task = session.uploadTask(with: request, fromFile: job.url)
-        task.taskDescription = job.id.uuidString
-        task.resume()
-    }
-
-    private func finishEvent() {
-        guard let eventName = uploadQueue.first?.eventName else {
-            clearPersistedQueueAfterCompletion()
-            return
-        }
-
-        let totalBytes = uploadQueue.reduce(Int64(0)) { $0 + $1.fileSize }
-        let fileCount = uploadQueue.count
-
-        Task {
-            do {
-                try await postJSON(
-                    path: "/complete-event",
-                    body: EventCompleteRequest(
-                        event_name: eventName,
-                        selected_extensions: selectedExtensions,
-                        file_count: fileCount,
-                        total_bytes: totalBytes
-                    )
-                )
-
-                resetSpeedMeter()
-
-                publish {
-                    self.completedFiles = fileCount
-                    self.overallProgress = 1
-                    self.isUploading = false
-                    self.isPaused = false
-                    self.sessionCompleted = true
-                    self.currentFile = ""
-                    self.speedMBs = 0
-                    self.speedMbps = 0
-                    self.etaText = "0s"
-                    self.statusText = "HOÀN TẤT — đã gửi \(fileCount) file."
+        guard let job =
+            uploadQueue.first(
+                where: {
+                    $0.id == jobID
                 }
+            )
+        else {
+            return
+        }
 
-                clearPersistedQueueAfterCompletion()
-            } catch {
-                fail(
-                    "Đã gửi file nhưng chưa đánh dấu hoàn tất: \(error.localizedDescription)"
-                )
+        completedJobIDs.insert(jobID)
+
+        stateLock.lock()
+        sentByTask.removeValue(
+            forKey: taskIdentifier
+        )
+        stateLock.unlock()
+
+        if job.cleanupAfterUpload {
+            try? FileManager.default
+                .removeItem(at: job.url)
+        }
+
+        persistQueue()
+        publishState()
+
+        if completedJobIDs.count >=
+            uploadQueue.count {
+
+            resetSpeedMeter()
+
+            publish {
+                self.completedFiles =
+                    self.uploadQueue.count
+
+                self.overallProgress = 1
+                self.isUploading = false
+                self.isPaused = false
+                self.sessionCompleted = true
+                self.currentFile = ""
+                self.speedMBps = 0
+                self.etaText = "0s"
+
+                self.statusText =
+                    "HOÀN TẤT — server đã nhận \(self.uploadQueue.count) file."
             }
+
+            // Server v1.5 tự tạo
+            // UPLOAD_COMPLETE.json khi đủ job,
+            // nên app không phải thức để gọi complete-event.
+            try? FileManager.default
+                .removeItem(at: queueStoreURL)
         }
     }
+
+    // MARK: - Persistence
+
+    private func loadQueue() {
+        guard let data =
+            try? Data(contentsOf: queueStoreURL),
+              let payload =
+            try? JSONDecoder()
+                .decode(
+                    PersistedQueue.self,
+                    from: data
+                )
+        else {
+            return
+        }
+
+        uploadQueue = payload.queue
+        completedJobIDs =
+            Set(payload.completedJobIDs)
+
+        serverBase =
+            payload.serverBase
+
+        selectedExtensions =
+            payload.selectedExtensions
+    }
+
+    private func persistQueue() {
+        let payload =
+            PersistedQueue(
+                queue: uploadQueue,
+                completedJobIDs:
+                    Array(completedJobIDs),
+                serverBase: serverBase,
+                selectedExtensions:
+                    selectedExtensions
+            )
+
+        if let data =
+            try? JSONEncoder()
+                .encode(payload) {
+
+            try? data.write(
+                to: queueStoreURL,
+                options: .atomic
+            )
+        }
+    }
+
+    // MARK: - HTTP metadata
 
     private func postJSON<T: Encodable>(
         path: String,
         body: T
     ) async throws {
-        guard var components = URLComponents(string: serverBase) else {
+
+        guard var components =
+            URLComponents(string: serverBase)
+        else {
             throw NSError(
                 domain: "RawBridge",
                 code: -1,
                 userInfo: [
-                    NSLocalizedDescriptionKey: "Server URL không hợp lệ."
+                    NSLocalizedDescriptionKey:
+                        "Server URL không hợp lệ."
                 ]
             )
         }
 
         var basePath = components.path
-        if basePath.hasSuffix("/") { basePath.removeLast() }
+
+        if basePath.hasSuffix("/") {
+            basePath.removeLast()
+        }
+
         components.path = basePath + path
 
         guard let url = components.url else {
@@ -404,24 +618,47 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
                 domain: "RawBridge",
                 code: -1,
                 userInfo: [
-                    NSLocalizedDescriptionKey: "Server URL không hợp lệ."
+                    NSLocalizedDescriptionKey:
+                        "Server URL không hợp lệ."
                 ]
             )
         }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+
         request.setValue(
             "application/json",
-            forHTTPHeaderField: "Content-Type"
+            forHTTPHeaderField:
+                "Content-Type"
         )
-        request.httpBody = try JSONEncoder().encode(body)
+
+        request.httpBody =
+            try JSONEncoder().encode(body)
+
         request.timeoutInterval = 15
 
-        let (_, response) = try await URLSession.shared.data(for: request)
-        let code = (response as? HTTPURLResponse)?.statusCode ?? 500
+        let config =
+            URLSessionConfiguration.ephemeral
 
-        guard (200...299).contains(code) else {
+        config.allowsCellularAccess = true
+        config.allowsExpensiveNetworkAccess = true
+        config.allowsConstrainedNetworkAccess = true
+
+        let foreground =
+            URLSession(configuration: config)
+
+        let (_, response) =
+            try await foreground
+                .data(for: request)
+
+        let code =
+            (response as? HTTPURLResponse)?
+                .statusCode ?? 500
+
+        guard (200...299)
+            .contains(code)
+        else {
             throw NSError(
                 domain: "RawBridge",
                 code: code,
@@ -433,54 +670,141 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
         }
     }
 
-    private func loadQueue() {
-        guard let data = try? Data(contentsOf: queueStoreURL),
-              let payload = try? JSONDecoder().decode(
-                PersistedQueue.self,
-                from: data
-              ) else {
+    // MARK: - Progress / speed
+
+    private func publishState() {
+        let completed =
+            completedJobIDs.count
+
+        let completedBytes =
+            uploadQueue
+                .filter {
+                    completedJobIDs
+                        .contains($0.id)
+                }
+                .reduce(Int64(0)) {
+                    $0 + $1.fileSize
+                }
+
+        let totalBytes =
+            uploadQueue.reduce(Int64(0)) {
+                $0 + $1.fileSize
+            }
+
+        stateLock.lock()
+
+        let activeSent =
+            sentByTask.values.reduce(
+                Int64(0),
+                +
+            )
+
+        stateLock.unlock()
+
+        let sent =
+            min(
+                completedBytes + activeSent,
+                totalBytes
+            )
+
+        let progress =
+            totalBytes > 0
+            ? Double(sent) /
+                Double(totalBytes)
+            : 0
+
+        publish {
+            self.totalFiles =
+                self.uploadQueue.count
+
+            self.completedFiles =
+                completed
+
+            self.overallProgress =
+                min(max(progress, 0), 1)
+
+            self.isUploading =
+                completed <
+                self.uploadQueue.count
+        }
+    }
+
+    private func updateSpeed(
+        aggregateSent: Int64,
+        totalBytes: Int64
+    ) {
+        let now =
+            Date()
+                .timeIntervalSinceReferenceDate
+
+        var displaySpeed =
+            smoothedBytesPerSecond
+
+        if lastSpeedTime == 0 {
+            lastSpeedTime = now
+            lastSpeedBytes =
+                aggregateSent
             return
         }
 
-        uploadQueue = payload.queue
-        currentIndex = payload.currentIndex
-        serverBase = payload.serverBase
-        selectedExtensions = payload.selectedExtensions
-    }
+        let dt =
+            now - lastSpeedTime
 
-    private func persistQueue() {
-        let payload = PersistedQueue(
-            queue: uploadQueue,
-            currentIndex: currentIndex,
-            serverBase: serverBase,
-            selectedExtensions: selectedExtensions
-        )
-
-        if let data = try? JSONEncoder().encode(payload) {
-            try? data.write(to: queueStoreURL, options: .atomic)
+        guard dt >= 0.35 else {
+            return
         }
-    }
 
-    private func clearPersistedQueueAfterCompletion() {
-        uploadQueue.removeAll()
-        currentIndex = 0
-        totalBytesExpected = 0
-        totalBytesCompleted = 0
-        try? FileManager.default.removeItem(at: queueStoreURL)
-    }
+        let delta =
+            max(
+                aggregateSent -
+                lastSpeedBytes,
+                0
+            )
 
-    private func fail(_ text: String) {
-        resetSpeedMeter()
+        let instant =
+            Double(delta) / dt
+
+        if smoothedBytesPerSecond <= 0 {
+            smoothedBytesPerSecond =
+                instant
+        } else {
+            smoothedBytesPerSecond =
+                smoothedBytesPerSecond *
+                    0.70 +
+                instant * 0.30
+        }
+
+        displaySpeed =
+            smoothedBytesPerSecond
+
+        lastSpeedTime = now
+        lastSpeedBytes =
+            aggregateSent
+
+        let remaining =
+            max(
+                totalBytes -
+                aggregateSent,
+                0
+            )
+
+        let eta =
+            displaySpeed > 1024
+            ? Double(remaining) /
+                displaySpeed
+            : Double.nan
+
+        let mbps =
+            displaySpeed /
+            1_000_000.0
+
+        let etaString =
+            formattedETA(eta)
 
         publish {
-            self.isUploading = false
-            self.speedMBs = 0
-            self.speedMbps = 0
-            self.etaText = "--"
-            self.statusText = text
+            self.speedMBps = mbps
+            self.etaText = etaString
         }
-
-        persistQueue()
     }
 
     private func resetSpeedMeter() {
@@ -489,14 +813,18 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
         smoothedBytesPerSecond = 0
     }
 
-    private func publish(_ block: @escaping () -> Void) {
-        DispatchQueue.main.async(execute: block)
-    }
+    private func formattedETA(
+        _ seconds: Double
+    ) -> String {
 
-    private func formattedETA(_ seconds: Double) -> String {
-        guard seconds.isFinite, seconds >= 0 else { return "--" }
+        guard seconds.isFinite,
+              seconds >= 0
+        else {
+            return "--"
+        }
 
-        let total = Int(seconds.rounded())
+        let total =
+            Int(seconds.rounded())
 
         if total < 60 {
             return "\(total)s"
@@ -511,10 +839,46 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
 
         let hours = minutes / 60
         let min = minutes % 60
+
         return "\(hours)h \(min)m"
     }
 
-    // MARK: URLSessionTaskDelegate
+    private func jobID(
+        from task: URLSessionTask
+    ) -> UUID? {
+
+        guard let description =
+            task.taskDescription
+        else {
+            return nil
+        }
+
+        return UUID(
+            uuidString: description
+        )
+    }
+
+    private func fail(_ text: String) {
+        resetSpeedMeter()
+
+        publish {
+            self.statusText = text
+            self.speedMBps = 0
+            self.etaText = "--"
+        }
+
+        persistQueue()
+    }
+
+    private func publish(
+        _ block: @escaping () -> Void
+    ) {
+        DispatchQueue.main.async(
+            execute: block
+        )
+    }
+
+    // MARK: - URLSessionTaskDelegate
 
     func urlSession(
         _ session: URLSession,
@@ -523,55 +887,81 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
         totalBytesSent: Int64,
         totalBytesExpectedToSend: Int64
     ) {
-        let sentOverall = totalBytesCompleted + totalBytesSent
-        let total = max(totalBytesExpected, 1)
-        let now = Date().timeIntervalSinceReferenceDate
+        guard let jobID =
+            jobID(from: task)
+        else {
+            return
+        }
 
-        var displaySpeed = smoothedBytesPerSecond
+        guard let job =
+            uploadQueue.first(
+                where: {
+                    $0.id == jobID
+                }
+            )
+        else {
+            return
+        }
 
-        if lastSpeedTime == 0 {
-            lastSpeedTime = now
-            lastSpeedBytes = sentOverall
-        } else {
-            let dt = now - lastSpeedTime
+        stateLock.lock()
 
-            if dt >= 0.35 {
-                let byteDelta = max(sentOverall - lastSpeedBytes, 0)
-                let instant = Double(byteDelta) / dt
+        sentByTask[
+            task.taskIdentifier
+        ] = min(
+            totalBytesSent,
+            job.fileSize
+        )
 
-                if smoothedBytesPerSecond <= 0 {
-                    smoothedBytesPerSecond = instant
-                } else {
-                    smoothedBytesPerSecond =
-                        (smoothedBytesPerSecond * 0.70) + (instant * 0.30)
+        let activeSent =
+            sentByTask.values.reduce(
+                Int64(0),
+                +
+            )
+
+        stateLock.unlock()
+
+        let completedBytes =
+            uploadQueue
+                .filter {
+                    completedJobIDs
+                        .contains($0.id)
+                }
+                .reduce(Int64(0)) {
+                    $0 + $1.fileSize
                 }
 
-                displaySpeed = smoothedBytesPerSecond
-                lastSpeedTime = now
-                lastSpeedBytes = sentOverall
+        let totalBytes =
+            uploadQueue.reduce(Int64(0)) {
+                $0 + $1.fileSize
             }
-        }
 
-        let remaining = max(totalBytesExpected - sentOverall, 0)
-        let eta =
-            displaySpeed > 1024
-            ? Double(remaining) / displaySpeed
-            : Double.nan
-
-        let mbPerSecond = displaySpeed / 1_000_000.0
-        let megabitsPerSecond = mbPerSecond * 8.0
-        let etaString = formattedETA(eta)
+        let aggregateSent =
+            min(
+                completedBytes +
+                    activeSent,
+                totalBytes
+            )
 
         publish {
-            self.overallProgress =
-                min(Double(sentOverall) / Double(total), 1.0)
+            self.currentFile =
+                job.relativePath
 
-            if displaySpeed > 0 {
-                self.speedMBs = mbPerSecond
-                self.speedMbps = megabitsPerSecond
-                self.etaText = etaString
+            if totalBytes > 0 {
+                self.overallProgress =
+                    Double(aggregateSent) /
+                    Double(totalBytes)
             }
+
+            self.statusText =
+                "Background queue đang chạy • \(self.completedJobIDs.count)/\(self.uploadQueue.count) file xong."
         }
+
+        updateSpeed(
+            aggregateSent:
+                aggregateSent,
+            totalBytes:
+                totalBytes
+        )
     }
 
     func urlSession(
@@ -579,54 +969,94 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
         task: URLSessionTask,
         didCompleteWithError error: Error?
     ) {
+        guard let jobID =
+            jobID(from: task)
+        else {
+            return
+        }
+
+        stateLock.lock()
+        sentByTask.removeValue(
+            forKey: task.taskIdentifier
+        )
+        stateLock.unlock()
+
         if let error {
-            fail(
-                "Upload bị gián đoạn: \(error.localizedDescription). Bấm TIẾP TỤC để gửi lại file hiện tại."
-            )
+            // Giữ queue. Khi app được mở lại
+            // hoặc người dùng bấm tiếp tục,
+            // job bị lỗi sẽ được schedule lại.
+            publish {
+                self.statusText =
+                    "Một file bị gián đoạn: \(error.localizedDescription). Queue vẫn được giữ."
+            }
+
+            persistQueue()
+
+            // Nếu app vẫn còn sống, thử schedule
+            // lại job sau khoảng ngắn.
+            DispatchQueue.global()
+                .asyncAfter(
+                    deadline: .now() + 1.0
+                ) {
+                    self.session
+                        .getAllTasks {
+                            tasks in
+
+                            let active =
+                                Set(
+                                    tasks
+                                        .compactMap {
+                                            self.jobID(
+                                                from: $0
+                                            )
+                                        }
+                                )
+
+                            self.scheduleMissingTasks(
+                                excluding:
+                                    active
+                            )
+                        }
+                }
+
             return
         }
 
-        let code = (task.response as? HTTPURLResponse)?.statusCode ?? 500
+        let code =
+            (task.response as?
+                HTTPURLResponse)?
+                .statusCode ?? 500
 
-        guard (200...299).contains(code) else {
-            fail("Server trả lỗi HTTP \(code).")
+        guard (200...299)
+            .contains(code)
+        else {
+            publish {
+                self.statusText =
+                    "Server trả HTTP \(code). Queue vẫn được giữ để thử lại."
+            }
+
+            persistQueue()
             return
         }
 
-        guard currentIndex < uploadQueue.count else {
-            finishEvent()
-            return
-        }
-
-        let job = uploadQueue[currentIndex]
-
-        if job.cleanupAfterUpload {
-            try? FileManager.default.removeItem(at: job.url)
-        }
-
-        totalBytesCompleted += job.fileSize
-        currentIndex += 1
-        persistQueue()
-
-        publish {
-            self.completedFiles = self.currentIndex
-            self.overallProgress =
-                min(
-                    Double(self.totalBytesCompleted) /
-                        Double(max(self.totalBytesExpected, 1)),
-                    1.0
-                )
-        }
-
-        startNextIfNeeded()
+        markCompleted(
+            jobID: jobID,
+            taskIdentifier:
+                task.taskIdentifier
+        )
     }
 
     func urlSessionDidFinishEvents(
-        forBackgroundURLSession session: URLSession
+        forBackgroundURLSession session:
+            URLSession
     ) {
         publish {
-            let handler = self.backgroundCompletionHandler
-            self.backgroundCompletionHandler = nil
+            let handler =
+                self.backgroundCompletionHandler
+
+            self.backgroundCompletionHandler =
+                nil
+
             handler?()
         }
     }

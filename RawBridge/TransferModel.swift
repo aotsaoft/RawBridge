@@ -1,6 +1,7 @@
 import Foundation
+import Combine
 
-enum MediaCategory: String {
+enum MediaCategory: String, Codable {
     case raw = "RAW"
     case photo = "PHOTO"
     case video = "VIDEO"

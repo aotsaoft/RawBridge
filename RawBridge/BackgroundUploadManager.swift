@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTaskDelegate, URLSessionDataDelegate {
     static let shared = RawBackgroundUploadManager()

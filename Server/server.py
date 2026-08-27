@@ -3,9 +3,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pathlib import Path
 from datetime import datetime, timezone
+from starlette.requests import ClientDisconnect
+import asyncio
 import json
 import re
 import time
+import uuid
 
 app = FastAPI()
 
@@ -28,6 +31,9 @@ VIDEO_EXTS = {
     ".mp4", ".mov", ".m4v", ".mts", ".m2ts",
     ".avi", ".mkv", ".3gp"
 }
+
+# Prevent two completed uploads from racing for the same final filename.
+finalize_lock = asyncio.Lock()
 
 
 class EventMeta(BaseModel):
@@ -98,12 +104,30 @@ def destination_base(root: Path, filename: str) -> Path:
     return root / "OTHER" / label
 
 
+async def safe_delete(path: Path, attempts: int = 8) -> None:
+    """Best-effort cleanup; never mask the real upload error on Windows."""
+    if not path.exists():
+        return
+
+    for i in range(attempts):
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except PermissionError:
+            # Another request, antivirus, indexer, etc. may hold it briefly.
+            await asyncio.sleep(0.15 * (i + 1))
+        except FileNotFoundError:
+            return
+        except Exception:
+            return
+
+
 @app.get("/health")
 def health():
     return {
         "ok": True,
         "service": "RAW Bridge Receiver",
-        "version": "1.2"
+        "version": "1.2.2"
     }
 
 
@@ -146,40 +170,59 @@ async def upload_file(
     parts = [p for p in relative.split("/") if p not in ("", ".", "..")]
     subdirs = parts[:-1]
 
-    dest_dir = destination_base(root, filename)
-    for part in subdirs:
-        dest_dir = dest_dir / safe_piece(part)[:120]
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    # IMPORTANT:
+    # Incomplete files live OUTSIDE PHOTO/VIDEO so downstream RAW tools
+    # never see a half-written file.
+    incomplete_dir = root / "_INCOMPLETE"
+    incomplete_dir.mkdir(parents=True, exist_ok=True)
 
-    final_path = unique_path(dest_dir / filename)
-    temp_path = final_path.with_suffix(final_path.suffix + ".part")
+    upload_id = uuid.uuid4().hex
+    temp_path = incomplete_dir / f"{upload_id}_{filename}.part"
 
-    started = time.perf_counter()
     total = 0
+    started = time.perf_counter()
 
     try:
-        with temp_path.open("wb") as f:
+        # Exclusive create: impossible for two requests to share the same temp file.
+        with temp_path.open("xb") as f:
             async for chunk in request.stream():
                 if not chunk:
                     continue
                 f.write(chunk)
                 total += len(chunk)
 
-        temp_path.replace(final_path)
+        # Determine destination only after the complete file has arrived.
+        dest_dir = destination_base(root, filename)
+        for part in subdirs:
+            dest_dir = dest_dir / safe_piece(part)[:120]
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        async with finalize_lock:
+            final_path = unique_path(dest_dir / filename)
+            # Same drive -> atomic rename/move in normal Windows operation.
+            temp_path.replace(final_path)
+
+        elapsed = max(time.perf_counter() - started, 0.001)
+
+        return JSONResponse({
+            "ok": True,
+            "bytes": total,
+            "seconds": round(elapsed, 3),
+            "saved_to": str(final_path)
+        })
+
+    except ClientDisconnect:
+        await safe_delete(temp_path)
+        # Avoid noisy stack traces when the phone pauses/drops the connection.
+        return JSONResponse(
+            {"ok": False, "error": "client_disconnected"},
+            status_code=499
+        )
 
     except Exception:
-        if temp_path.exists():
-            temp_path.unlink(missing_ok=True)
+        # Cleanup must NEVER replace the original exception with WinError 32.
+        await safe_delete(temp_path)
         raise
-
-    elapsed = max(time.perf_counter() - started, 0.001)
-
-    return JSONResponse({
-        "ok": True,
-        "bytes": total,
-        "seconds": round(elapsed, 3),
-        "saved_to": str(final_path)
-    })
 
 
 @app.post("/complete-event")
@@ -203,7 +246,6 @@ def complete_event(info: EventComplete):
     with marker.open("w", encoding="utf-8") as f:
         json.dump(completion, f, ensure_ascii=False, indent=2)
 
-    # Also update event.json status if it exists.
     meta_path = event_dir / "event.json"
     if meta_path.exists():
         try:

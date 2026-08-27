@@ -67,7 +67,7 @@ final class PhotoLibraryScanner {
         let outURL = exportDir.appendingPathComponent(safeFilename)
 
         if !FileManager.default.fileExists(atPath: outURL.path) {
-            try await withCheckedThrowingContinuation { continuation in
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 let opts = PHAssetResourceRequestOptions()
                 opts.isNetworkAccessAllowed = true
                 PHAssetResourceManager.default().writeData(for: resource, toFile: outURL, options: opts) { error in

@@ -11,6 +11,11 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
     @Published private(set) var overallProgress: Double = 0
     @Published private(set) var isUploading: Bool = false
     @Published private(set) var isPaused: Bool = false
+    @Published private(set) var sessionCompleted: Bool = false
+
+    @Published private(set) var speedMBs: Double = 0
+    @Published private(set) var speedMbps: Double = 0
+    @Published private(set) var etaText: String = "--"
 
     private let queueStoreURL: URL
     private var uploadQueue: [UploadJob] = []
@@ -21,6 +26,10 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
     private var totalBytesCompleted: Int64 = 0
     private var backgroundCompletionHandler: (() -> Void)?
 
+    private var lastSpeedTime: TimeInterval = 0
+    private var lastSpeedBytes: Int64 = 0
+    private var smoothedBytesPerSecond: Double = 0
+
     private lazy var session: URLSession = {
         let config = URLSessionConfiguration.background(
             withIdentifier: "com.aotasoft.RawBridge.background-upload"
@@ -30,6 +39,7 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
         config.waitsForConnectivity = true
         config.timeoutIntervalForRequest = 300
         config.timeoutIntervalForResource = 60 * 60 * 24
+
         return URLSession(
             configuration: config,
             delegate: self,
@@ -92,7 +102,6 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
         queueStoreURL = folder.appendingPathComponent("upload_queue.json")
         super.init()
 
-        // Force creation now so iOS can reconnect background tasks.
         _ = session
         loadQueue()
     }
@@ -109,15 +118,17 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
             return
         }
 
+        totalBytesExpected = uploadQueue.reduce(0) { $0 + $1.fileSize }
+        totalBytesCompleted = uploadQueue
+            .prefix(currentIndex)
+            .reduce(0) { $0 + $1.fileSize }
+
         publish {
             self.totalFiles = self.uploadQueue.count
             self.completedFiles = self.currentIndex
             self.currentFile = self.uploadQueue[self.currentIndex].relativePath
-            self.totalBytesExpected = self.uploadQueue.reduce(0) { $0 + $1.fileSize }
-            self.totalBytesCompleted = self.uploadQueue
-                .prefix(self.currentIndex)
-                .reduce(0) { $0 + $1.fileSize }
             self.isUploading = true
+            self.sessionCompleted = false
             self.statusText = "Đang khôi phục queue upload..."
         }
 
@@ -174,7 +185,7 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
         currentIndex = 0
         totalBytesExpected = expectedBytes
         totalBytesCompleted = 0
-
+        resetSpeedMeter()
         persistQueue()
 
         publish {
@@ -184,6 +195,10 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
             self.overallProgress = 0
             self.isUploading = true
             self.isPaused = false
+            self.sessionCompleted = false
+            self.speedMBs = 0
+            self.speedMbps = 0
+            self.etaText = "--"
             self.statusText = "Bắt đầu upload nền..."
         }
 
@@ -193,9 +208,15 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
     func pause() {
         session.getAllTasks { [weak self] tasks in
             guard let self else { return }
+
             tasks.forEach { $0.suspend() }
+            self.resetSpeedMeter()
+
             self.publish {
                 self.isPaused = true
+                self.speedMBs = 0
+                self.speedMbps = 0
+                self.etaText = "--"
                 self.statusText = "Đã tạm dừng."
             }
         }
@@ -204,6 +225,8 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
     func resume() {
         session.getAllTasks { [weak self] tasks in
             guard let self else { return }
+
+            self.resetSpeedMeter()
 
             if tasks.isEmpty {
                 self.publish {
@@ -214,12 +237,43 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
                 self.startNextIfNeeded()
             } else {
                 tasks.forEach { $0.resume() }
+
                 self.publish {
                     self.isPaused = false
                     self.isUploading = true
                     self.statusText = "Đang tiếp tục upload..."
                 }
             }
+        }
+    }
+
+    func resetForNewSession() {
+        guard !isUploading else { return }
+
+        for job in uploadQueue where job.cleanupAfterUpload {
+            try? FileManager.default.removeItem(at: job.url)
+        }
+
+        uploadQueue.removeAll()
+        currentIndex = 0
+        selectedExtensions = []
+        totalBytesExpected = 0
+        totalBytesCompleted = 0
+        resetSpeedMeter()
+        try? FileManager.default.removeItem(at: queueStoreURL)
+
+        publish {
+            self.totalFiles = 0
+            self.completedFiles = 0
+            self.currentFile = ""
+            self.statusText = "Chưa upload."
+            self.overallProgress = 0
+            self.isUploading = false
+            self.isPaused = false
+            self.sessionCompleted = false
+            self.speedMBs = 0
+            self.speedMbps = 0
+            self.etaText = "--"
         }
     }
 
@@ -232,6 +286,7 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
         }
 
         let job = uploadQueue[currentIndex]
+        resetSpeedMeter()
 
         publish {
             self.currentFile = job.relativePath
@@ -247,6 +302,7 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
 
         var path = components.path
         if path.hasSuffix("/") { path.removeLast() }
+
         components.path = path + "/upload-file"
         components.queryItems = [
             URLQueryItem(name: "event_name", value: job.eventName),
@@ -282,7 +338,7 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
 
     private func finishEvent() {
         guard let eventName = uploadQueue.first?.eventName else {
-            clearPersistedQueue(keepUI: true)
+            clearPersistedQueueAfterCompletion()
             return
         }
 
@@ -301,18 +357,26 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
                     )
                 )
 
+                resetSpeedMeter()
+
                 publish {
                     self.completedFiles = fileCount
                     self.overallProgress = 1
                     self.isUploading = false
                     self.isPaused = false
+                    self.sessionCompleted = true
                     self.currentFile = ""
+                    self.speedMBs = 0
+                    self.speedMbps = 0
+                    self.etaText = "0s"
                     self.statusText = "HOÀN TẤT — đã gửi \(fileCount) file."
                 }
 
-                clearPersistedQueue(keepUI: true)
+                clearPersistedQueueAfterCompletion()
             } catch {
-                fail("Đã gửi file nhưng chưa đánh dấu hoàn tất: \(error.localizedDescription)")
+                fail(
+                    "Đã gửi file nhưng chưa đánh dấu hoàn tất: \(error.localizedDescription)"
+                )
             }
         }
     }
@@ -325,7 +389,9 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
             throw NSError(
                 domain: "RawBridge",
                 code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Server URL không hợp lệ."]
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Server URL không hợp lệ."
+                ]
             )
         }
 
@@ -337,7 +403,9 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
             throw NSError(
                 domain: "RawBridge",
                 code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Server URL không hợp lệ."]
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Server URL không hợp lệ."
+                ]
             )
         }
 
@@ -348,6 +416,7 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
             forHTTPHeaderField: "Content-Type"
         )
         request.httpBody = try JSONEncoder().encode(body)
+        request.timeoutInterval = 15
 
         let (_, response) = try await URLSession.shared.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 500
@@ -356,7 +425,10 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
             throw NSError(
                 domain: "RawBridge",
                 code: code,
-                userInfo: [NSLocalizedDescriptionKey: "Server trả lỗi HTTP \(code)."]
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Server trả lỗi HTTP \(code)."
+                ]
             )
         }
     }
@@ -389,36 +461,57 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
         }
     }
 
-    private func clearPersistedQueue(keepUI: Bool) {
+    private func clearPersistedQueueAfterCompletion() {
         uploadQueue.removeAll()
         currentIndex = 0
         totalBytesExpected = 0
         totalBytesCompleted = 0
         try? FileManager.default.removeItem(at: queueStoreURL)
-
-        if !keepUI {
-            publish {
-                self.totalFiles = 0
-                self.completedFiles = 0
-                self.currentFile = ""
-                self.overallProgress = 0
-                self.isUploading = false
-                self.isPaused = false
-                self.statusText = "Chưa upload."
-            }
-        }
     }
 
     private func fail(_ text: String) {
+        resetSpeedMeter()
+
         publish {
             self.isUploading = false
+            self.speedMBs = 0
+            self.speedMbps = 0
+            self.etaText = "--"
             self.statusText = text
         }
+
         persistQueue()
+    }
+
+    private func resetSpeedMeter() {
+        lastSpeedTime = 0
+        lastSpeedBytes = 0
+        smoothedBytesPerSecond = 0
     }
 
     private func publish(_ block: @escaping () -> Void) {
         DispatchQueue.main.async(execute: block)
+    }
+
+    private func formattedETA(_ seconds: Double) -> String {
+        guard seconds.isFinite, seconds >= 0 else { return "--" }
+
+        let total = Int(seconds.rounded())
+
+        if total < 60 {
+            return "\(total)s"
+        }
+
+        let minutes = total / 60
+        let sec = total % 60
+
+        if minutes < 60 {
+            return "\(minutes)m \(sec)s"
+        }
+
+        let hours = minutes / 60
+        let min = minutes % 60
+        return "\(hours)h \(min)m"
     }
 
     // MARK: URLSessionTaskDelegate
@@ -432,10 +525,52 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
     ) {
         let sentOverall = totalBytesCompleted + totalBytesSent
         let total = max(totalBytesExpected, 1)
+        let now = Date().timeIntervalSinceReferenceDate
+
+        var displaySpeed = smoothedBytesPerSecond
+
+        if lastSpeedTime == 0 {
+            lastSpeedTime = now
+            lastSpeedBytes = sentOverall
+        } else {
+            let dt = now - lastSpeedTime
+
+            if dt >= 0.35 {
+                let byteDelta = max(sentOverall - lastSpeedBytes, 0)
+                let instant = Double(byteDelta) / dt
+
+                if smoothedBytesPerSecond <= 0 {
+                    smoothedBytesPerSecond = instant
+                } else {
+                    smoothedBytesPerSecond =
+                        (smoothedBytesPerSecond * 0.70) + (instant * 0.30)
+                }
+
+                displaySpeed = smoothedBytesPerSecond
+                lastSpeedTime = now
+                lastSpeedBytes = sentOverall
+            }
+        }
+
+        let remaining = max(totalBytesExpected - sentOverall, 0)
+        let eta =
+            displaySpeed > 1024
+            ? Double(remaining) / displaySpeed
+            : Double.nan
+
+        let mbPerSecond = displaySpeed / 1_000_000.0
+        let megabitsPerSecond = mbPerSecond * 8.0
+        let etaString = formattedETA(eta)
 
         publish {
             self.overallProgress =
                 min(Double(sentOverall) / Double(total), 1.0)
+
+            if displaySpeed > 0 {
+                self.speedMBs = mbPerSecond
+                self.speedMbps = megabitsPerSecond
+                self.etaText = etaString
+            }
         }
     }
 
@@ -446,7 +581,7 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
     ) {
         if let error {
             fail(
-                "Upload bị gián đoạn: \(error.localizedDescription). Mở/tiếp tục app để gửi tiếp file hiện tại."
+                "Upload bị gián đoạn: \(error.localizedDescription). Bấm TIẾP TỤC để gửi lại file hiện tại."
             )
             return
         }

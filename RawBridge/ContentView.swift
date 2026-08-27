@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var model = TransferModel()
+
     @ObservedObject private var uploader =
         RawBackgroundUploadManager.shared
 
@@ -13,9 +14,8 @@ struct ContentView: View {
             ScrollView {
                 VStack(spacing: 16) {
                     eventCard
-                    sourceCard
+                    mediaSourceCard
                     connectionCard
-                    pickerCard
 
                     if !model.extensionStats.isEmpty {
                         extensionPickerCard
@@ -29,13 +29,13 @@ struct ContentView: View {
             .sheet(isPresented: $showFolderPicker) {
                 FolderPicker { url in
                     showFolderPicker = false
-                    model.scanFilesFolder(url)
+                    model.addFilesFolder(url)
                 }
             }
             .sheet(isPresented: $showPhotoPicker) {
                 PhotoPicker { assetIDs in
                     showPhotoPicker = false
-                    model.importCameraRoll(assetIDs: assetIDs)
+                    model.addCameraRoll(assetIDs: assetIDs)
                 }
             }
         }
@@ -58,7 +58,7 @@ struct ContentView: View {
                 .foregroundStyle(.secondary)
 
             TextEditor(text: $model.roughContent)
-                .frame(minHeight: 110)
+                .frame(minHeight: 105)
                 .padding(8)
                 .background(
                     RoundedRectangle(cornerRadius: 12)
@@ -70,7 +70,7 @@ struct ContentView: View {
                 )
 
             Text(
-                "Nội dung này được lưu vào event.json để dùng cho AI viết content/caption và voice."
+                "Lưu vào event.json để dùng tiếp cho AI viết content/caption và voice."
             )
             .font(.footnote)
             .foregroundStyle(.secondary)
@@ -78,29 +78,99 @@ struct ContentView: View {
         .cardStyle()
     }
 
-    private var sourceCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("2 • NGUỒN DỮ LIỆU")
+    private var mediaSourceCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("2 • THÊM MEDIA")
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
 
-            Picker(
-                "Nguồn dữ liệu",
-                selection: $model.importSource
-            ) {
-                ForEach(ImportSource.allCases) { source in
-                    Text(source.rawValue).tag(source)
-                }
-            }
-            .pickerStyle(.segmented)
-
             Text(
-                model.importSource == .files
-                    ? "Thẻ SD, đầu đọc thẻ hoặc thư mục trong Files."
-                    : "Chọn nhiều ảnh/video trực tiếp trong ứng dụng Ảnh."
+                "Có thể thêm cả hai nguồn trong cùng một phiên."
             )
             .font(.footnote)
             .foregroundStyle(.secondary)
+
+            Button {
+                showFolderPicker = true
+            } label: {
+                Label(
+                    "THÊM TỪ THẺ / FILES",
+                    systemImage: "externaldrive.badge.plus"
+                )
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(
+                model.scanning ||
+                model.preparing ||
+                uploader.isUploading
+            )
+
+            Button {
+                showPhotoPicker = true
+            } label: {
+                Label(
+                    "THÊM TỪ CAMERA ROLL",
+                    systemImage: "photo.stack"
+                )
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(
+                model.scanning ||
+                model.preparing ||
+                uploader.isUploading
+            )
+
+            HStack(spacing: 12) {
+                mediaCount(
+                    title: "THẺ / FILES",
+                    value: model.filesSourceCount
+                )
+
+                Divider()
+
+                mediaCount(
+                    title: "CAMERA ROLL",
+                    value: model.cameraRollCount
+                )
+
+                Divider()
+
+                mediaCount(
+                    title: "TỔNG",
+                    value: model.items.count
+                )
+            }
+            .frame(maxWidth: .infinity)
+
+            if !model.items.isEmpty && !uploader.isUploading {
+                Button(role: .destructive) {
+                    model.clearMediaSelection()
+                } label: {
+                    Label(
+                        "Xóa danh sách media",
+                        systemImage: "trash"
+                    )
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            }
+
+            if model.scanning || model.preparing {
+                ProgressView()
+                    .frame(maxWidth: .infinity)
+
+                Text(model.status)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            } else if !model.items.isEmpty {
+                Text(
+                    "\(model.items.count) file • \(model.totalSizeText)"
+                )
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            }
         }
         .cardStyle()
     }
@@ -121,86 +191,45 @@ struct ContentView: View {
             .textFieldStyle(.roundedBorder)
 
             Button {
-                Task { await model.testConnection() }
+                Task {
+                    await model.testConnection()
+                }
             } label: {
-                Label(
-                    "Kiểm tra kết nối",
-                    systemImage: "network"
-                )
+                HStack {
+                    if model.isTestingConnection {
+                        ProgressView()
+                    } else {
+                        Image(systemName: "network")
+                    }
+
+                    Text(
+                        model.isTestingConnection
+                            ? "Đang kiểm tra..."
+                            : "Kiểm tra kết nối"
+                    )
+                }
                 .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
-        }
-        .cardStyle()
-    }
+            .disabled(model.isTestingConnection)
 
-    private var pickerCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("4 • CHỌN DỮ LIỆU")
-                .font(.caption.bold())
-                .foregroundStyle(.secondary)
-
-            HStack {
+            HStack(alignment: .top, spacing: 8) {
                 Image(
-                    systemName:
-                        model.importSource == .files
-                        ? "externaldrive"
-                        : "photo.on.rectangle.angled"
+                    systemName: connectionIcon
                 )
-                .font(.title2)
+                .foregroundStyle(connectionColor)
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(model.selectedFolderName)
-                        .font(.headline)
-
-                    Text(
-                        model.scanning
-                        ? "Đang đọc dữ liệu..."
-                        : "\(model.items.count) file • \(model.totalSizeText)"
-                    )
+                Text(model.connectionStatus)
                     .font(.footnote)
-                    .foregroundStyle(.secondary)
-                }
-
-                Spacer()
-            }
-
-            Button {
-                if model.importSource == .files {
-                    showFolderPicker = true
-                } else {
-                    showPhotoPicker = true
-                }
-            } label: {
-                Label(
-                    model.importSource == .files
-                        ? "Chọn thư mục"
-                        : "Chọn ảnh / video",
-                    systemImage:
-                        model.importSource == .files
-                        ? "folder.badge.plus"
-                        : "photo.stack"
-                )
-                .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(
-                model.scanning ||
-                model.preparing ||
-                uploader.isUploading
-            )
-
-            if model.scanning || model.preparing {
-                ProgressView()
-                    .frame(maxWidth: .infinity)
-            }
-
-            if model.preparing {
-                Text(
-                    "Đang sao chép file đã chọn vào vùng an toàn của app để iOS có thể upload khi app chạy nền."
-                )
-                .font(.footnote)
-                .foregroundStyle(.secondary)
+                    .foregroundStyle(
+                        model.connectionOK == nil
+                            ? Color.secondary
+                            : connectionColor
+                    )
+                    .frame(
+                        maxWidth: .infinity,
+                        alignment: .leading
+                    )
             }
         }
         .cardStyle()
@@ -208,7 +237,7 @@ struct ContentView: View {
 
     private var extensionPickerCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("5 • TÍCH ĐUÔI FILE CẦN GỬI")
+            Text("4 • TÍCH ĐUÔI FILE CẦN GỬI")
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
 
@@ -275,7 +304,7 @@ struct ContentView: View {
 
     private var transferCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("6 • GỬI VỀ PC")
+            Text("5 • GỬI VỀ PC")
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
 
@@ -292,7 +321,9 @@ struct ContentView: View {
                 Text(
                     "\(uploader.completedFiles)/\(uploader.totalFiles) file"
                 )
+
                 Spacer()
+
                 Text(
                     "\(Int(uploader.overallProgress * 100))%"
                 )
@@ -300,8 +331,52 @@ struct ContentView: View {
             .font(.footnote.monospacedDigit())
             .foregroundStyle(.secondary)
 
+            if uploader.isUploading && !uploader.isPaused {
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("TỐC ĐỘ")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+
+                        Text(
+                            String(
+                                format: "%.2f MB/s",
+                                uploader.speedMBs
+                            )
+                        )
+                        .font(.headline.monospacedDigit())
+
+                        Text(
+                            String(
+                                format: "%.1f Mbps",
+                                uploader.speedMbps
+                            )
+                        )
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    }
+
+                    Spacer()
+
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text("CÒN LẠI")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+
+                        Text(uploader.etaText)
+                            .font(.headline.monospacedDigit())
+                    }
+                }
+                .padding(10)
+                .background(
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Color.secondary.opacity(0.08))
+                )
+            }
+
             Text(
                 uploader.isUploading ||
+                uploader.sessionCompleted ||
                 uploader.completedFiles > 0
                     ? uploader.statusText
                     : model.status
@@ -335,10 +410,29 @@ struct ContentView: View {
                 }
 
                 Text(
-                    "Có thể chuyển sang app khác hoặc khóa màn hình sau khi phần chuẩn bị hoàn tất. Nếu force-quit RAW Bridge, file đang gửi có thể phải gửi lại, nhưng queue các file đã xong vẫn được giữ."
+                    "Sau khi bước chuẩn bị hoàn tất, có thể chuyển app hoặc khóa màn hình. Force-quit có thể làm file đang truyền phải gửi lại, nhưng các file đã hoàn tất vẫn được ghi nhớ."
                 )
                 .font(.footnote)
                 .foregroundStyle(.secondary)
+
+            } else if uploader.sessionCompleted {
+                Button {
+                    model.newTransferSession()
+                } label: {
+                    Label(
+                        "TẠO PHIÊN GỬI MỚI",
+                        systemImage: "plus.circle.fill"
+                    )
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+
+                Text(
+                    "Dùng để gửi sự kiện/lần thứ 2 mà không cần tắt rồi mở lại app."
+                )
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
             } else {
                 Button {
                     Task {
@@ -365,6 +459,47 @@ struct ContentView: View {
             }
         }
         .cardStyle()
+    }
+
+    private func mediaCount(
+        title: String,
+        value: Int
+    ) -> some View {
+        VStack(spacing: 2) {
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            Text("\(value)")
+                .font(.headline.monospacedDigit())
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var connectionIcon: String {
+        if model.isTestingConnection {
+            return "clock"
+        }
+
+        switch model.connectionOK {
+        case true:
+            return "checkmark.circle.fill"
+        case false:
+            return "xmark.circle.fill"
+        case nil:
+            return "circle.dashed"
+        }
+    }
+
+    private var connectionColor: Color {
+        switch model.connectionOK {
+        case true:
+            return .green
+        case false:
+            return .red
+        case nil:
+            return .secondary
+        }
     }
 
     private func categoryText(

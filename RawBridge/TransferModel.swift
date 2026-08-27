@@ -30,6 +30,9 @@ final class TransferModel: ObservableObject {
         let size: Int64
         let ext: String
         let category: MediaCategory
+
+        // false = file từ thẻ/Files, cần copy vào app sandbox trước background upload.
+        // true = Camera Roll đã export vào app sandbox.
         let cleanupAfterUpload: Bool
     }
 
@@ -49,17 +52,19 @@ final class TransferModel: ObservableObject {
     @Published var eventName = ""
     @Published var roughContent = ""
     @Published var serverURL = "http://100.120.33.35:8000"
-    @Published var importSource: ImportSource = .files
 
-    @Published var selectedFolderName = "Chưa chọn"
     @Published var items: [MediaRef] = []
     @Published var selectedExtensions: Set<String> = []
 
     @Published var scanning = false
     @Published var preparing = false
-    @Published var status = "Nhập thông tin sự kiện rồi chọn nguồn dữ liệu."
+    @Published var status = "Nhập thông tin sự kiện rồi thêm dữ liệu."
 
-    private var scopedFolderURL: URL?
+    @Published var connectionStatus = "Chưa kiểm tra kết nối."
+    @Published var connectionOK: Bool? = nil
+    @Published var isTestingConnection = false
+
+    private var scopedFolderURLs: [URL] = []
     private let uploader = RawBackgroundUploadManager.shared
 
     init() {
@@ -67,11 +72,14 @@ final class TransferModel: ObservableObject {
     }
 
     deinit {
-        scopedFolderURL?.stopAccessingSecurityScopedResource()
+        for url in scopedFolderURLs {
+            url.stopAccessingSecurityScopedResource()
+        }
     }
 
     var extensionStats: [ExtensionStat] {
         let grouped = Dictionary(grouping: items, by: { $0.ext })
+
         return grouped.map { ext, files in
             ExtensionStat(
                 ext: ext,
@@ -106,6 +114,14 @@ final class TransferModel: ObservableObject {
         )
     }
 
+    var filesSourceCount: Int {
+        items.filter { !$0.cleanupAfterUpload }.count
+    }
+
+    var cameraRollCount: Int {
+        items.filter { $0.cleanupAfterUpload }.count
+    }
+
     func isSelected(_ ext: String) -> Bool {
         selectedExtensions.contains(ext)
     }
@@ -119,41 +135,93 @@ final class TransferModel: ObservableObject {
     }
 
     func testConnection() async {
+        guard !isTestingConnection else { return }
+
         guard let url = endpoint("/health") else {
-            status = "Địa chỉ server không hợp lệ."
+            connectionOK = false
+            connectionStatus = "Địa chỉ server không hợp lệ."
             return
         }
 
-        status = "Đang kiểm tra kết nối..."
+        isTestingConnection = true
+        connectionOK = nil
+        connectionStatus = "Đang kiểm tra \(url.host ?? "server")..."
+
+        defer {
+            isTestingConnection = false
+        }
 
         do {
-            let (_, response) = try await URLSession.shared.data(from: url)
-            guard let http = response as? HTTPURLResponse,
-                  (200...299).contains(http.statusCode) else {
-                status = "Không kết nối được server."
+            var request = URLRequest(url: url)
+            request.httpMethod = "GET"
+            request.timeoutInterval = 8
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+
+            let config = URLSessionConfiguration.ephemeral
+            config.waitsForConnectivity = false
+            config.timeoutIntervalForRequest = 8
+            config.timeoutIntervalForResource = 8
+
+            let session = URLSession(configuration: config)
+            let (data, response) = try await session.data(for: request)
+
+            guard let http = response as? HTTPURLResponse else {
+                connectionOK = false
+                connectionStatus = "Không nhận được phản hồi HTTP từ PC."
                 return
             }
-            status = "Kết nối PC thành công qua Tailscale."
+
+            guard (200...299).contains(http.statusCode) else {
+                connectionOK = false
+                connectionStatus = "PC có phản hồi nhưng server trả HTTP \(http.statusCode)."
+                return
+            }
+
+            var detail = ""
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let service = json["service"] as? String
+                let version = json["version"] as? String
+
+                if let service, let version {
+                    detail = " • \(service) v\(version)"
+                } else if let version {
+                    detail = " • server v\(version)"
+                }
+            }
+
+            connectionOK = true
+            connectionStatus = "Kết nối thành công\(detail)"
         } catch {
-            status = "Lỗi kết nối: \(error.localizedDescription)"
+            connectionOK = false
+
+            if let urlError = error as? URLError {
+                switch urlError.code {
+                case .timedOut:
+                    connectionStatus = "Hết thời gian chờ. Kiểm tra Tailscale và server PC."
+                case .cannotConnectToHost:
+                    connectionStatus = "Không kết nối được cổng 8000 trên PC."
+                case .notConnectedToInternet:
+                    connectionStatus = "iPhone hiện không có kết nối mạng."
+                default:
+                    connectionStatus = "Lỗi kết nối: \(urlError.localizedDescription)"
+                }
+            } else {
+                connectionStatus = "Lỗi kết nối: \(error.localizedDescription)"
+            }
         }
     }
 
-    func scanFilesFolder(_ url: URL) {
-        scopedFolderURL?.stopAccessingSecurityScopedResource()
-        scopedFolderURL = nil
+    // MARK: - Thẻ / Files: THÊM vào danh sách hiện tại, không xóa Camera Roll
 
+    func addFilesFolder(_ url: URL) {
         guard url.startAccessingSecurityScopedResource() else {
             status = "iOS không cấp quyền truy cập thư mục này."
             return
         }
 
-        scopedFolderURL = url
+        scopedFolderURLs.append(url)
         scanning = true
-        items = []
-        selectedExtensions = []
-        selectedFolderName = url.lastPathComponent
-        status = "Đang quét thư mục..."
+        status = "Đang quét thẻ / Files..."
 
         let baseURL = url
 
@@ -182,8 +250,6 @@ final class TransferModel: ObservableObject {
                     let ext = fileURL.pathExtension.lowercased()
                     guard !ext.isEmpty else { continue }
 
-                    let category = Self.category(for: ext)
-
                     let relative = fileURL.path.hasPrefix(basePath)
                         ? String(fileURL.path.dropFirst(basePath.count))
                         : fileURL.lastPathComponent
@@ -192,10 +258,10 @@ final class TransferModel: ObservableObject {
                         MediaRef(
                             url: fileURL,
                             fileName: fileURL.lastPathComponent,
-                            relativePath: relative,
+                            relativePath: "Files/\(baseURL.lastPathComponent)/\(relative)",
                             size: Int64(values?.fileSize ?? 0),
                             ext: ext,
-                            category: category,
+                            category: Self.category(for: ext),
                             cleanupAfterUpload: false
                         )
                     )
@@ -206,27 +272,31 @@ final class TransferModel: ObservableObject {
                 }
             }.value
 
-            self.items = result
+            self.appendUnique(result)
             self.scanning = false
-            self.status = "Quét xong \(result.count) file. Hãy tích đuôi cần gửi."
+            self.status =
+                "Đã thêm \(result.count) file từ thẻ/Files. Tổng hiện có \(self.items.count) file."
         }
     }
 
-    func importCameraRoll(assetIDs: [String]) {
+    // MARK: - Camera Roll: THÊM vào danh sách hiện tại, không xóa thẻ/Files
+
+    func addCameraRoll(assetIDs: [String]) {
         guard !assetIDs.isEmpty else { return }
 
         scanning = true
-        items = []
-        selectedExtensions = []
-        selectedFolderName = "Camera Roll"
         status = "Đang lấy file gốc từ Camera Roll..."
 
         Task {
             do {
-                let result = try await PhotoLibraryScanner.shared.importAssets(assetIDs: assetIDs)
-                self.items = result
+                let result = try await PhotoLibraryScanner.shared.importAssets(
+                    assetIDs: assetIDs
+                )
+
+                self.appendUnique(result)
                 self.scanning = false
-                self.status = "Đã lấy \(result.count) file gốc từ Camera Roll. Hãy tích đuôi cần gửi."
+                self.status =
+                    "Đã thêm \(result.count) file từ Camera Roll. Tổng hiện có \(self.items.count) file."
             } catch {
                 self.scanning = false
                 self.status = "Không đọc được Camera Roll: \(error.localizedDescription)"
@@ -234,8 +304,48 @@ final class TransferModel: ObservableObject {
         }
     }
 
+    private func appendUnique(_ newItems: [MediaRef]) {
+        // Tránh add trùng cùng một file trong cùng lần thao tác.
+        var existing = Set(
+            items.map {
+                "\($0.relativePath.lowercased())|\($0.size)"
+            }
+        )
+
+        for item in newItems {
+            let key = "\(item.relativePath.lowercased())|\(item.size)"
+            if existing.insert(key).inserted {
+                items.append(item)
+            } else if item.cleanupAfterUpload {
+                // Camera Roll export ra file tạm nhưng bị trùng -> dọn file tạm.
+                try? FileManager.default.removeItem(at: item.url)
+            }
+        }
+    }
+
+    func clearMediaSelection() {
+        guard !uploader.isUploading else { return }
+
+        for item in items where item.cleanupAfterUpload {
+            try? FileManager.default.removeItem(at: item.url)
+        }
+
+        items = []
+        selectedExtensions = []
+
+        for url in scopedFolderURLs {
+            url.stopAccessingSecurityScopedResource()
+        }
+        scopedFolderURLs = []
+
+        status = "Đã xóa danh sách media. Có thể chọn lại từ thẻ và Camera Roll."
+    }
+
+    // MARK: - Upload mixed sources
+
     func startUpload() async {
         let cleanEvent = eventName.trimmingCharacters(in: .whitespacesAndNewlines)
+
         guard !cleanEvent.isEmpty else {
             status = "Hãy nhập tên sự kiện."
             return
@@ -248,17 +358,12 @@ final class TransferModel: ObservableObject {
         }
 
         preparing = true
-        status = "Đang chuẩn bị file cho upload nền..."
+        status = "Đang chuẩn bị \(files.count) file cho upload nền..."
 
         do {
-            let preparedFiles: [MediaRef]
-
-            if importSource == .files {
-                preparedFiles = try await stageExternalFiles(files, eventName: cleanEvent)
-            } else {
-                // Camera Roll imports are already exported into app sandbox.
-                preparedFiles = files
-            }
+            // Media từ Camera Roll đã ở app sandbox.
+            // Media từ thẻ/Files được copy vào app sandbox.
+            let preparedFiles = try await prepareMixedFiles(files)
 
             try await uploader.enqueueAndStart(
                 serverBase: serverURL,
@@ -276,10 +381,16 @@ final class TransferModel: ObservableObject {
         preparing = false
     }
 
-    private func stageExternalFiles(
-        _ files: [MediaRef],
-        eventName: String
+    private func prepareMixedFiles(
+        _ files: [MediaRef]
     ) async throws -> [MediaRef] {
+        let externalFiles = files.filter { !$0.cleanupAfterUpload }
+        let alreadyLocal = files.filter { $0.cleanupAfterUpload }
+
+        guard !externalFiles.isEmpty else {
+            return alreadyLocal
+        }
+
         let support = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
@@ -294,35 +405,37 @@ final class TransferModel: ObservableObject {
             withIntermediateDirectories: true
         )
 
-        let totalBytes = files.reduce(Int64(0)) { $0 + $1.size }
+        let externalBytes = externalFiles.reduce(Int64(0)) { $0 + $1.size }
 
         if let values = try? support.resourceValues(
             forKeys: [.volumeAvailableCapacityForImportantUsageKey]
         ), let available = values.volumeAvailableCapacityForImportantUsage {
-            let required = totalBytes + 300_000_000
+
+            let required = externalBytes + 300_000_000
+
             if available < required {
                 throw NSError(
                     domain: "RawBridge",
                     code: 10,
                     userInfo: [
                         NSLocalizedDescriptionKey:
-                            "iPhone không đủ dung lượng trống để chuẩn bị upload nền. Cần khoảng \(ByteCountFormatter.string(fromByteCount: required, countStyle: .file))."
+                            "iPhone không đủ dung lượng trống để copy media từ thẻ cho upload nền. Cần khoảng \(ByteCountFormatter.string(fromByteCount: required, countStyle: .file))."
                     ]
                 )
             }
         }
 
-        return try await Task.detached(priority: .userInitiated) {
+        let stagedExternal: [MediaRef] = try await Task.detached(
+            priority: .userInitiated
+        ) {
             let fm = FileManager.default
             var staged: [MediaRef] = []
 
-            for (index, item) in files.enumerated() {
-                let safeName = "\(index)_\(UUID().uuidString)_\(item.fileName)"
-                let target = stagingRoot.appendingPathComponent(safeName)
+            for (index, item) in externalFiles.enumerated() {
+                let safeName =
+                    "\(index)_\(UUID().uuidString)_\(item.fileName)"
 
-                if fm.fileExists(atPath: target.path) {
-                    try fm.removeItem(at: target)
-                }
+                let target = stagingRoot.appendingPathComponent(safeName)
 
                 try fm.copyItem(at: item.url, to: target)
 
@@ -341,6 +454,35 @@ final class TransferModel: ObservableObject {
 
             return staged
         }.value
+
+        // Giữ đúng thứ tự tương đối không quan trọng; PC vẫn phân loại theo đường dẫn/đuôi.
+        return stagedExternal + alreadyLocal
+    }
+
+    // MARK: - Phiên mới
+
+    func newTransferSession() {
+        guard !uploader.isUploading else { return }
+
+        uploader.resetForNewSession()
+
+        for item in items where item.cleanupAfterUpload {
+            try? FileManager.default.removeItem(at: item.url)
+        }
+
+        for url in scopedFolderURLs {
+            url.stopAccessingSecurityScopedResource()
+        }
+        scopedFolderURLs = []
+
+        eventName = ""
+        roughContent = ""
+        items = []
+        selectedExtensions = []
+        scanning = false
+        preparing = false
+        status = "Phiên mới. Nhập tên sự kiện và thêm media."
+        // Giữ nguyên serverURL và trạng thái kết nối để thao tác nhanh.
     }
 
     private func endpoint(_ suffix: String) -> URL? {

@@ -132,3 +132,7 @@ Sau đó copy phần log màu đỏ gửi lại để sửa.
 - HTTP hiện chỉ dùng để test trong Tailnet.
 
 Các phần này nên thêm sau khi xác nhận app cài được, quét được cả thư mục và truyền file ổn định.
+
+
+## Bản 1.3
+- Có thêm Camera Roll và background upload.

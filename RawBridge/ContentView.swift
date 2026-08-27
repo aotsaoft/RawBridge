@@ -2,15 +2,18 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var model = TransferModel()
+    @ObservedObject private var uploader = RawBackgroundUploadManager.shared
     @State private var showFolderPicker = false
+    @State private var timer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 16) {
                     eventCard
+                    sourceCard
                     connectionCard
-                    folderCard
+                    pickerCard
 
                     if !model.extensionStats.isEmpty {
                         extensionPickerCard
@@ -24,8 +27,11 @@ struct ContentView: View {
             .sheet(isPresented: $showFolderPicker) {
                 FolderPicker { url in
                     showFolderPicker = false
-                    model.selectFolder(url)
+                    model.scanFilesFolder(url)
                 }
+            }
+            .onReceive(timer) { _ in
+                model.syncFromUploader()
             }
         }
     }
@@ -36,11 +42,8 @@ struct ContentView: View {
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
 
-            TextField(
-                "Tên sự kiện, ví dụ: Khai giảng 2026",
-                text: $model.eventName
-            )
-            .textFieldStyle(.roundedBorder)
+            TextField("Tên sự kiện, ví dụ: Khai giảng 2026", text: $model.eventName)
+                .textFieldStyle(.roundedBorder)
 
             Text("CONTENT SƠ BỘ")
                 .font(.caption2.bold())
@@ -49,36 +52,49 @@ struct ContentView: View {
             TextEditor(text: $model.roughContent)
                 .frame(minHeight: 120)
                 .padding(8)
-                .background(
-                    RoundedRectangle(cornerRadius: 12)
-                        .fill(Color.secondary.opacity(0.10))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12)
-                        .stroke(Color.secondary.opacity(0.20))
-                )
+                .background(RoundedRectangle(cornerRadius: 12).fill(Color.secondary.opacity(0.10)))
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.secondary.opacity(0.20)))
 
-            Text("Phần này sẽ được lưu vào event.json để sau đó đưa cho AI viết caption/content và voice script.")
+            Text("Phần này được lưu vào event.json để dùng cho AI viết caption/content và voice.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }
         .cardStyle()
     }
 
-    private var connectionCard: some View {
+    private var sourceCard: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("PC QUA TAILSCALE")
+            Text("2 • NGUỒN DỮ LIỆU")
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
 
-            TextField(
-                "http://100.x.x.x:8000",
-                text: $model.serverURL
-            )
-            .textInputAutocapitalization(.never)
-            .autocorrectionDisabled()
-            .keyboardType(.URL)
-            .textFieldStyle(.roundedBorder)
+            Picker("Nguồn dữ liệu", selection: $model.importSource) {
+                ForEach(ImportSource.allCases) { src in
+                    Text(src.rawValue).tag(src)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            Text(model.importSource == .files
+                 ? "Dùng cho thẻ SD, đầu đọc thẻ, Files."
+                 : "Dùng cho ảnh/video đã nằm trong ứng dụng Ảnh / Camera Roll.")
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+        }
+        .cardStyle()
+    }
+
+    private var connectionCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("3 • PC QUA TAILSCALE")
+                .font(.caption.bold())
+                .foregroundStyle(.secondary)
+
+            TextField("http://100.x.x.x:8000", text: $model.serverURL)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(.URL)
+                .textFieldStyle(.roundedBorder)
 
             Button {
                 Task { await model.testConnection() }
@@ -87,49 +103,44 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
-            .disabled(model.uploading)
         }
         .cardStyle()
     }
 
-    private var folderCard: some View {
+    private var pickerCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("2 • CHỌN THƯ MỤC / THẺ NHỚ")
+            Text("4 • CHỌN DỮ LIỆU")
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
 
             HStack {
-                Image(systemName: "externaldrive")
+                Image(systemName: model.importSource == .files ? "externaldrive" : "photo.on.rectangle.angled")
                     .font(.title2)
-
                 VStack(alignment: .leading, spacing: 2) {
                     Text(model.selectedFolderName)
                         .font(.headline)
-
-                    Text(
-                        model.scanning
-                        ? "Đang quét ở nền..."
-                        : "\(model.items.count) file • \(model.totalSizeText)"
-                    )
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                    Text(model.scanning ? "Đang quét ở nền..." : "\(model.items.count) file • \(model.totalSizeText)")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
                 }
-
                 Spacer()
             }
 
             Button {
-                showFolderPicker = true
+                if model.importSource == .files {
+                    showFolderPicker = true
+                } else {
+                    model.scanCameraRoll()
+                }
             } label: {
-                Label("Chọn thư mục", systemImage: "folder.badge.plus")
+                Label(model.importSource == .files ? "Chọn thư mục" : "Quét Camera Roll", systemImage: model.importSource == .files ? "folder.badge.plus" : "photo.stack")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
-            .disabled(model.uploading || model.scanning)
+            .disabled(model.scanning || uploader.isUploading)
 
             if model.scanning {
-                ProgressView()
-                    .frame(maxWidth: .infinity)
+                ProgressView().frame(maxWidth: .infinity)
             }
         }
         .cardStyle()
@@ -137,7 +148,7 @@ struct ContentView: View {
 
     private var extensionPickerCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("3 • TÍCH ĐUÔI FILE CẦN GỬI")
+            Text("5 • TÍCH ĐUÔI FILE CẦN GỬI")
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
 
@@ -154,20 +165,14 @@ struct ContentView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(".\(stat.ext.uppercased())")
                                 .font(.headline.monospaced())
-
                             Text(categoryText(stat.category))
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
-
                         Spacer()
-
                         VStack(alignment: .trailing, spacing: 2) {
-                            Text("\(stat.count) file")
-                                .font(.subheadline)
-                            Text(stat.sizeText)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            Text("\(stat.count) file").font(.subheadline)
+                            Text(stat.sizeText).font(.caption).foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -180,76 +185,56 @@ struct ContentView: View {
 
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("ĐÃ CHỌN")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    Text("\(model.selectedCount) file")
-                        .font(.headline)
+                    Text("ĐÃ CHỌN").font(.caption2).foregroundStyle(.secondary)
+                    Text("\(model.selectedCount) file").font(.headline)
                 }
-
                 Spacer()
-
-                Text(model.selectedSizeText)
-                    .font(.headline.monospacedDigit())
+                Text(model.selectedSizeText).font(.headline.monospacedDigit())
             }
-            .padding(.top, 4)
         }
         .cardStyle()
     }
 
     private var transferCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("4 • GỬI VỀ PC")
+            Text("6 • GỬI VỀ PC")
                 .font(.caption.bold())
                 .foregroundStyle(.secondary)
 
-            if !model.currentFile.isEmpty {
-                Text(model.currentFile)
+            if !uploader.currentFile.isEmpty {
+                Text(uploader.currentFile)
                     .font(.footnote.monospaced())
                     .lineLimit(2)
             }
 
-            ProgressView(value: model.overallProgress)
+            ProgressView(value: uploader.overallProgress)
                 .progressViewStyle(.linear)
 
             HStack {
-                Text("\(Int(model.overallProgress * 100))%")
+                Text("\(uploader.completedFiles)/\(uploader.totalFiles) file")
                 Spacer()
-                Text(String(format: "%.2f MB/s", model.averageSpeedMBs))
-                Spacer()
-                Text("Còn \(model.etaText)")
+                Text("\(Int(uploader.overallProgress * 100))%")
             }
             .font(.footnote.monospacedDigit())
             .foregroundStyle(.secondary)
 
-            Text(model.status)
+            Text(uploader.statusText.isEmpty ? model.status : uploader.statusText)
                 .font(.footnote)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-            if model.uploading {
-                Button(role: .destructive) {
-                    model.stopUpload()
-                } label: {
-                    Label("Dừng", systemImage: "stop.fill")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
+            if uploader.isUploading {
+                Text("Upload nền đang chạy. Có thể ra ngoài app; khi mở lại app sẽ khôi phục queue còn lại.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             } else {
                 Button {
                     Task { await model.startUpload() }
                 } label: {
-                    Label(
-                        "Gửi \(model.selectedCount) file về PC",
-                        systemImage: "arrow.up.circle.fill"
-                    )
-                    .frame(maxWidth: .infinity)
+                    Label("Gửi \(model.selectedCount) file về PC", systemImage: "arrow.up.circle.fill")
+                        .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(
-                    model.selectedCount == 0 ||
-                    model.scanning ||
-                    model.eventName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                )
+                .disabled(model.selectedCount == 0 || model.scanning || model.eventName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .cardStyle()
@@ -269,9 +254,6 @@ private extension View {
     func cardStyle() -> some View {
         self
             .padding()
-            .background(
-                .regularMaterial,
-                in: RoundedRectangle(cornerRadius: 18)
-            )
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
     }
 }

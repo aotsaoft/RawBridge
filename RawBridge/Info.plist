@@ -17,13 +17,17 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.2.1</string>
+    <string>1.3</string>
     <key>CFBundleVersion</key>
-    <string>4</string>
+    <string>5</string>
     <key>LSRequiresIPhoneOS</key>
     <true/>
     <key>NSLocalNetworkUsageDescription</key>
     <string>RAW Bridge cần kết nối với máy tính của bạn qua Tailscale để gửi ảnh RAW và video.</string>
+    <key>NSPhotoLibraryUsageDescription</key>
+    <string>RAW Bridge cần quyền truy cập Ảnh để gửi ảnh/video từ Camera Roll về máy tính của bạn.</string>
+    <key>NSPhotoLibraryAddUsageDescription</key>
+    <string>RAW Bridge có thể cần lưu tạm file đã export trong vùng dữ liệu ứng dụng để upload về máy tính.</string>
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsArbitraryLoads</key>

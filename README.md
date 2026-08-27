@@ -1,9 +1,3 @@
-# RAW Bridge 1.3
-
-Xem `UPDATE_V1.3.md`.
-
----
-
 # RAW Bridge 1.2
 
 Bản mới: content sơ bộ + quét/tích từng đuôi file + PC tự tách PHOTO/VIDEO + event metadata.

@@ -23,11 +23,9 @@
     <key>LSRequiresIPhoneOS</key>
     <true/>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>RAW Bridge cần kết nối với máy tính của bạn qua Tailscale để gửi ảnh RAW và video.</string>
+    <string>RAW Bridge cần kết nối với máy tính qua Tailscale để gửi ảnh và video.</string>
     <key>NSPhotoLibraryUsageDescription</key>
-    <string>RAW Bridge cần quyền truy cập Ảnh để gửi ảnh/video từ Camera Roll về máy tính của bạn.</string>
-    <key>NSPhotoLibraryAddUsageDescription</key>
-    <string>RAW Bridge có thể cần lưu tạm file đã export trong vùng dữ liệu ứng dụng để upload về máy tính.</string>
+    <string>RAW Bridge cần truy cập thư viện Ảnh để chọn và gửi ảnh/video gốc về máy tính.</string>
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsArbitraryLoads</key>

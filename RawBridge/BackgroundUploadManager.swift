@@ -1,44 +1,41 @@
 import Foundation
 import Combine
 
-final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTaskDelegate, URLSessionDataDelegate {
+final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTaskDelegate {
     static let shared = RawBackgroundUploadManager()
 
-    @Published var totalFiles: Int = 0
-    @Published var completedFiles: Int = 0
-    @Published var currentFile: String = ""
-    @Published var statusText: String = "Chưa upload."
-    @Published var overallProgress: Double = 0
-    @Published var isUploading: Bool = false
+    @Published private(set) var totalFiles: Int = 0
+    @Published private(set) var completedFiles: Int = 0
+    @Published private(set) var currentFile: String = ""
+    @Published private(set) var statusText: String = "Chưa upload."
+    @Published private(set) var overallProgress: Double = 0
+    @Published private(set) var isUploading: Bool = false
+    @Published private(set) var isPaused: Bool = false
 
     private let queueStoreURL: URL
     private var uploadQueue: [UploadJob] = []
     private var currentIndex: Int = 0
     private var serverBase: String = "http://100.120.33.35:8000"
-    private var session: URLSession!
-    private var taskMap: [Int: URL] = [:]
-    private var activeResponses: [Int: Data] = [:]
+    private var selectedExtensions: [String] = []
     private var totalBytesExpected: Int64 = 0
     private var totalBytesCompleted: Int64 = 0
+    private var backgroundCompletionHandler: (() -> Void)?
 
-    override init() {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let folder = support.appendingPathComponent("RawBridge", isDirectory: true)
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        self.queueStoreURL = folder.appendingPathComponent("upload_queue.json")
-
-        super.init()
-
-        let config = URLSessionConfiguration.background(withIdentifier: "com.aotasoft.RawBridge.bg")
+    private lazy var session: URLSession = {
+        let config = URLSessionConfiguration.background(
+            withIdentifier: "com.aotasoft.RawBridge.background-upload"
+        )
         config.sessionSendsLaunchEvents = true
         config.isDiscretionary = false
         config.waitsForConnectivity = true
         config.timeoutIntervalForRequest = 300
-        config.timeoutIntervalForResource = 60 * 60 * 12
-        self.session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
-
-        loadQueue()
-    }
+        config.timeoutIntervalForResource = 60 * 60 * 24
+        return URLSession(
+            configuration: config,
+            delegate: self,
+            delegateQueue: nil
+        )
+    }()
 
     struct UploadJob: Codable, Identifiable {
         let id: UUID
@@ -47,8 +44,18 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
         let relativePath: String
         let eventName: String
         let fileSize: Int64
+        let cleanupAfterUpload: Bool
 
-        var url: URL { URL(fileURLWithPath: filePath) }
+        var url: URL {
+            URL(fileURLWithPath: filePath)
+        }
+    }
+
+    struct PersistedQueue: Codable {
+        let queue: [UploadJob]
+        let currentIndex: Int
+        let serverBase: String
+        let selectedExtensions: [String]
     }
 
     struct EventMetaRequest: Codable {
@@ -66,43 +73,66 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
         let total_bytes: Int64
     }
 
-    func configure(serverBase: String) {
-        self.serverBase = serverBase
+    override init() {
+        let support = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first!
+
+        let folder = support.appendingPathComponent(
+            "RawBridge",
+            isDirectory: true
+        )
+
+        try? FileManager.default.createDirectory(
+            at: folder,
+            withIntermediateDirectories: true
+        )
+
+        queueStoreURL = folder.appendingPathComponent("upload_queue.json")
+        super.init()
+
+        // Force creation now so iOS can reconnect background tasks.
+        _ = session
+        loadQueue()
     }
 
-    func replaceQueue(with jobs: [UploadJob]) {
-        uploadQueue = jobs
-        currentIndex = 0
-        totalFiles = jobs.count
-        completedFiles = 0
-        totalBytesCompleted = 0
-        totalBytesExpected = jobs.reduce(0) { $0 + $1.fileSize }
-        persistQueue()
+    func setBackgroundCompletionHandler(_ handler: @escaping () -> Void) {
+        backgroundCompletionHandler = handler
     }
 
     func resumeFromDisk() {
         loadQueue()
-        if !uploadQueue.isEmpty {
-            totalFiles = uploadQueue.count
-            completedFiles = currentIndex
-            totalBytesExpected = uploadQueue.reduce(0) { $0 + $1.fileSize }
-            totalBytesCompleted = uploadQueue.prefix(currentIndex).reduce(0) { $0 + $1.fileSize }
-            isUploading = currentIndex < uploadQueue.count
-            statusText = isUploading ? "Khôi phục queue upload..." : "Queue đã hoàn tất."
-        }
-    }
 
-    func clearQueue() {
-        uploadQueue = []
-        currentIndex = 0
-        totalFiles = 0
-        completedFiles = 0
-        totalBytesCompleted = 0
-        totalBytesExpected = 0
-        overallProgress = 0
-        isUploading = false
-        statusText = "Đã xóa queue."
-        try? FileManager.default.removeItem(at: queueStoreURL)
+        guard !uploadQueue.isEmpty,
+              currentIndex < uploadQueue.count else {
+            return
+        }
+
+        publish {
+            self.totalFiles = self.uploadQueue.count
+            self.completedFiles = self.currentIndex
+            self.currentFile = self.uploadQueue[self.currentIndex].relativePath
+            self.totalBytesExpected = self.uploadQueue.reduce(0) { $0 + $1.fileSize }
+            self.totalBytesCompleted = self.uploadQueue
+                .prefix(self.currentIndex)
+                .reduce(0) { $0 + $1.fileSize }
+            self.isUploading = true
+            self.statusText = "Đang khôi phục queue upload..."
+        }
+
+        session.getAllTasks { [weak self] tasks in
+            guard let self else { return }
+
+            if tasks.isEmpty {
+                self.startNextIfNeeded()
+            } else {
+                self.publish {
+                    self.statusText = "Đã khôi phục tác vụ upload nền."
+                    self.isPaused = tasks.allSatisfy { $0.state == .suspended }
+                }
+            }
+        }
     }
 
     func enqueueAndStart(
@@ -112,67 +142,109 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
         selectedExtensions: [String],
         files: [TransferModel.MediaRef]
     ) async throws {
-        configure(serverBase: serverBase)
+        self.serverBase = serverBase
+        self.selectedExtensions = selectedExtensions
+
         let expectedBytes = files.reduce(Int64(0)) { $0 + $1.size }
 
-        try await postJSON(path: "/event-meta", body: EventMetaRequest(
-            event_name: eventName,
-            rough_content: roughContent,
-            selected_extensions: selectedExtensions,
-            expected_file_count: files.count,
-            expected_bytes: expectedBytes
-        ))
+        try await postJSON(
+            path: "/event-meta",
+            body: EventMetaRequest(
+                event_name: eventName,
+                rough_content: roughContent,
+                selected_extensions: selectedExtensions,
+                expected_file_count: files.count,
+                expected_bytes: expectedBytes
+            )
+        )
 
         let jobs = files.map {
             UploadJob(
                 id: UUID(),
                 filePath: $0.url.path,
-                fileName: $0.url.lastPathComponent,
+                fileName: $0.fileName,
                 relativePath: $0.relativePath,
                 eventName: eventName,
-                fileSize: $0.size
+                fileSize: $0.size,
+                cleanupAfterUpload: $0.cleanupAfterUpload
             )
         }
 
-        await MainActor.run {
-            self.replaceQueue(with: jobs)
+        uploadQueue = jobs
+        currentIndex = 0
+        totalBytesExpected = expectedBytes
+        totalBytesCompleted = 0
+
+        persistQueue()
+
+        publish {
+            self.totalFiles = jobs.count
+            self.completedFiles = 0
+            self.currentFile = jobs.first?.relativePath ?? ""
+            self.overallProgress = 0
             self.isUploading = true
+            self.isPaused = false
             self.statusText = "Bắt đầu upload nền..."
         }
 
-        startNextIfNeeded(selectedExtensions: selectedExtensions)
+        startNextIfNeeded()
     }
 
-    private func startNextIfNeeded(selectedExtensions: [String]) {
-        guard currentIndex < uploadQueue.count else {
-            Task {
-                if let eventName = uploadQueue.first?.eventName {
-                    try? await postJSON(path: "/complete-event", body: EventCompleteRequest(
-                        event_name: eventName,
-                        selected_extensions: selectedExtensions,
-                        file_count: uploadQueue.count,
-                        total_bytes: uploadQueue.reduce(0) { $0 + $1.fileSize }
-                    ))
-                }
-                await MainActor.run {
-                    self.isUploading = false
-                    self.statusText = "HOÀN TẤT — đã gửi xong queue."
-                    self.overallProgress = 1
-                }
-                self.clearQueue()
+    func pause() {
+        session.getAllTasks { [weak self] tasks in
+            guard let self else { return }
+            tasks.forEach { $0.suspend() }
+            self.publish {
+                self.isPaused = true
+                self.statusText = "Đã tạm dừng."
             }
+        }
+    }
+
+    func resume() {
+        session.getAllTasks { [weak self] tasks in
+            guard let self else { return }
+
+            if tasks.isEmpty {
+                self.publish {
+                    self.isPaused = false
+                    self.isUploading = true
+                    self.statusText = "Đang tiếp tục..."
+                }
+                self.startNextIfNeeded()
+            } else {
+                tasks.forEach { $0.resume() }
+                self.publish {
+                    self.isPaused = false
+                    self.isUploading = true
+                    self.statusText = "Đang tiếp tục upload..."
+                }
+            }
+        }
+    }
+
+    private func startNextIfNeeded() {
+        guard !isPaused else { return }
+
+        guard currentIndex < uploadQueue.count else {
+            finishEvent()
             return
         }
 
         let job = uploadQueue[currentIndex]
-        currentFile = job.relativePath
-        statusText = "Đang gửi \(currentIndex + 1)/\(uploadQueue.count): \(job.fileName)"
+
+        publish {
+            self.currentFile = job.relativePath
+            self.isUploading = true
+            self.statusText =
+                "Đang gửi \(self.currentIndex + 1)/\(self.uploadQueue.count): \(job.fileName)"
+        }
 
         guard var components = URLComponents(string: serverBase) else {
-            statusText = "Server URL không hợp lệ."
-            isUploading = false
+            fail("Server URL không hợp lệ.")
             return
         }
+
         var path = components.path
         if path.hasSuffix("/") { path.removeLast() }
         components.path = path + "/upload-file"
@@ -181,119 +253,246 @@ final class RawBackgroundUploadManager: NSObject, ObservableObject, URLSessionTa
             URLQueryItem(name: "relative_path", value: job.relativePath),
             URLQueryItem(name: "filename", value: job.fileName)
         ]
+
         guard let url = components.url else {
-            statusText = "Server URL không hợp lệ."
-            isUploading = false
+            fail("Server URL không hợp lệ.")
+            return
+        }
+
+        guard FileManager.default.fileExists(atPath: job.url.path) else {
+            fail("Không còn tìm thấy file: \(job.fileName)")
             return
         }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
-        request.setValue(String(job.fileSize), forHTTPHeaderField: "Content-Length")
+        request.setValue(
+            "application/octet-stream",
+            forHTTPHeaderField: "Content-Type"
+        )
+        request.setValue(
+            String(job.fileSize),
+            forHTTPHeaderField: "Content-Length"
+        )
 
         let task = session.uploadTask(with: request, fromFile: job.url)
-        taskMap[task.taskIdentifier] = job.url
-        activeResponses[task.taskIdentifier] = Data()
+        task.taskDescription = job.id.uuidString
         task.resume()
     }
 
-    private func postJSON<T: Encodable>(path: String, body: T) async throws {
-        guard var components = URLComponents(string: serverBase) else {
-            throw NSError(domain: "RawBridge", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid server URL"])
+    private func finishEvent() {
+        guard let eventName = uploadQueue.first?.eventName else {
+            clearPersistedQueue(keepUI: true)
+            return
         }
-        var p = components.path
-        if p.hasSuffix("/") { p.removeLast() }
-        components.path = p + path
+
+        let totalBytes = uploadQueue.reduce(Int64(0)) { $0 + $1.fileSize }
+        let fileCount = uploadQueue.count
+
+        Task {
+            do {
+                try await postJSON(
+                    path: "/complete-event",
+                    body: EventCompleteRequest(
+                        event_name: eventName,
+                        selected_extensions: selectedExtensions,
+                        file_count: fileCount,
+                        total_bytes: totalBytes
+                    )
+                )
+
+                publish {
+                    self.completedFiles = fileCount
+                    self.overallProgress = 1
+                    self.isUploading = false
+                    self.isPaused = false
+                    self.currentFile = ""
+                    self.statusText = "HOÀN TẤT — đã gửi \(fileCount) file."
+                }
+
+                clearPersistedQueue(keepUI: true)
+            } catch {
+                fail("Đã gửi file nhưng chưa đánh dấu hoàn tất: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func postJSON<T: Encodable>(
+        path: String,
+        body: T
+    ) async throws {
+        guard var components = URLComponents(string: serverBase) else {
+            throw NSError(
+                domain: "RawBridge",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Server URL không hợp lệ."]
+            )
+        }
+
+        var basePath = components.path
+        if basePath.hasSuffix("/") { basePath.removeLast() }
+        components.path = basePath + path
+
         guard let url = components.url else {
-            throw NSError(domain: "RawBridge", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid server URL"])
+            throw NSError(
+                domain: "RawBridge",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "Server URL không hợp lệ."]
+            )
         }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(
+            "application/json",
+            forHTTPHeaderField: "Content-Type"
+        )
         request.httpBody = try JSONEncoder().encode(body)
 
         let (_, response) = try await URLSession.shared.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 500
-        guard (200...299).contains(code) else {
-            throw NSError(domain: "RawBridge", code: code, userInfo: [NSLocalizedDescriptionKey: "Server trả lỗi \(code)"])
-        }
-    }
 
-    private func persistQueue() {
-        let payload = PersistedQueue(queue: uploadQueue, currentIndex: currentIndex)
-        if let data = try? JSONEncoder().encode(payload) {
-            try? data.write(to: queueStoreURL, options: .atomic)
+        guard (200...299).contains(code) else {
+            throw NSError(
+                domain: "RawBridge",
+                code: code,
+                userInfo: [NSLocalizedDescriptionKey: "Server trả lỗi HTTP \(code)."]
+            )
         }
     }
 
     private func loadQueue() {
         guard let data = try? Data(contentsOf: queueStoreURL),
-              let payload = try? JSONDecoder().decode(PersistedQueue.self, from: data) else { return }
-        self.uploadQueue = payload.queue
-        self.currentIndex = payload.currentIndex
+              let payload = try? JSONDecoder().decode(
+                PersistedQueue.self,
+                from: data
+              ) else {
+            return
+        }
+
+        uploadQueue = payload.queue
+        currentIndex = payload.currentIndex
+        serverBase = payload.serverBase
+        selectedExtensions = payload.selectedExtensions
     }
 
-    struct PersistedQueue: Codable {
-        let queue: [UploadJob]
-        let currentIndex: Int
+    private func persistQueue() {
+        let payload = PersistedQueue(
+            queue: uploadQueue,
+            currentIndex: currentIndex,
+            serverBase: serverBase,
+            selectedExtensions: selectedExtensions
+        )
+
+        if let data = try? JSONEncoder().encode(payload) {
+            try? data.write(to: queueStoreURL, options: .atomic)
+        }
     }
 
-    // MARK: URLSession delegates
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        activeResponses[dataTask.taskIdentifier, default: Data()].append(data)
+    private func clearPersistedQueue(keepUI: Bool) {
+        uploadQueue.removeAll()
+        currentIndex = 0
+        totalBytesExpected = 0
+        totalBytesCompleted = 0
+        try? FileManager.default.removeItem(at: queueStoreURL)
+
+        if !keepUI {
+            publish {
+                self.totalFiles = 0
+                self.completedFiles = 0
+                self.currentFile = ""
+                self.overallProgress = 0
+                self.isUploading = false
+                self.isPaused = false
+                self.statusText = "Chưa upload."
+            }
+        }
     }
 
-    func urlSession(_ session: URLSession,
-                    task: URLSessionTask,
-                    didSendBodyData bytesSent: Int64,
-                    totalBytesSent: Int64,
-                    totalBytesExpectedToSend: Int64) {
+    private func fail(_ text: String) {
+        publish {
+            self.isUploading = false
+            self.statusText = text
+        }
+        persistQueue()
+    }
+
+    private func publish(_ block: @escaping () -> Void) {
+        DispatchQueue.main.async(execute: block)
+    }
+
+    // MARK: URLSessionTaskDelegate
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didSendBodyData bytesSent: Int64,
+        totalBytesSent: Int64,
+        totalBytesExpectedToSend: Int64
+    ) {
         let sentOverall = totalBytesCompleted + totalBytesSent
         let total = max(totalBytesExpected, 1)
-        DispatchQueue.main.async {
-            self.overallProgress = min(Double(sentOverall) / Double(total), 1.0)
+
+        publish {
+            self.overallProgress =
+                min(Double(sentOverall) / Double(total), 1.0)
         }
     }
 
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        defer {
-            taskMap.removeValue(forKey: task.taskIdentifier)
-            activeResponses.removeValue(forKey: task.taskIdentifier)
-        }
-
-        if let error = error {
-            DispatchQueue.main.async {
-                self.isUploading = false
-                self.statusText = "Upload tạm dừng/lỗi: \(error.localizedDescription). Mở lại app để gửi tiếp queue."
-            }
-            persistQueue()
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        if let error {
+            fail(
+                "Upload bị gián đoạn: \(error.localizedDescription). Mở/tiếp tục app để gửi tiếp file hiện tại."
+            )
             return
         }
 
-        let statusCode = (task.response as? HTTPURLResponse)?.statusCode ?? 500
-        guard (200...299).contains(statusCode) else {
-            DispatchQueue.main.async {
-                self.isUploading = false
-                self.statusText = "Server lỗi HTTP \(statusCode)."
-            }
-            persistQueue()
+        let code = (task.response as? HTTPURLResponse)?.statusCode ?? 500
+
+        guard (200...299).contains(code) else {
+            fail("Server trả lỗi HTTP \(code).")
             return
         }
 
-        if currentIndex < uploadQueue.count {
-            totalBytesCompleted += uploadQueue[currentIndex].fileSize
-            currentIndex += 1
-            completedFiles = currentIndex
-            persistQueue()
+        guard currentIndex < uploadQueue.count else {
+            finishEvent()
+            return
         }
 
-        // Reuse currently selected extensions from queue snapshot
-        let exts = Array(Set(uploadQueue.map { URL(fileURLWithPath: $0.fileName).pathExtension.lowercased() })).sorted()
-        DispatchQueue.main.async {
-            self.statusText = "Đã gửi xong \(self.completedFiles)/\(self.totalFiles) file."
+        let job = uploadQueue[currentIndex]
+
+        if job.cleanupAfterUpload {
+            try? FileManager.default.removeItem(at: job.url)
         }
-        startNextIfNeeded(selectedExtensions: exts)
+
+        totalBytesCompleted += job.fileSize
+        currentIndex += 1
+        persistQueue()
+
+        publish {
+            self.completedFiles = self.currentIndex
+            self.overallProgress =
+                min(
+                    Double(self.totalBytesCompleted) /
+                        Double(max(self.totalBytesExpected, 1)),
+                    1.0
+                )
+        }
+
+        startNextIfNeeded()
+    }
+
+    func urlSessionDidFinishEvents(
+        forBackgroundURLSession session: URLSession
+    ) {
+        publish {
+            let handler = self.backgroundCompletionHandler
+            self.backgroundCompletionHandler = nil
+            handler?()
+        }
     }
 }
